@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+.venv/
+models.yaml
+.local-agent-chat/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+*.pyc
+Screenshot*.png
+.DS_Store

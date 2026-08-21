@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-agent-chat"
+version = "0.1.0"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "chainlit>=2.11,<2.12",
+  "deepagents>=0.7,<0.8",
+  "langchain>=1.2,<2",
+  "langchain-openai>=1.1,<2",
+  "langgraph-checkpoint-sqlite>=3.1,<4",
+  "aiosqlite>=0.20,<1",
+  "SQLAlchemy>=2.0,<3",
+  "PyYAML>=6,<7",
+  "python-dotenv>=1,<2",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff>=0.13,<1"]
+
+[tool.setuptools.packages.find]
+include = ["local_agent_chat*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
