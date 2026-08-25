@@ -7,6 +7,12 @@ from chainlit.types import Pagination, ThreadFilter
 from chainlit.user import User
 
 from local_agent_chat.chainlit_data import create_chainlit_data_layer
+from local_agent_chat.chat_titles import (
+    CHAT_TITLE_GENERATED,
+    CHAT_TITLE_MANUAL,
+    CHAT_TITLE_PENDING,
+    CHAT_TITLE_STATE_KEY,
+)
 
 
 @pytest.mark.asyncio
@@ -56,10 +62,10 @@ async def test_chainlit_history_is_available_after_data_layer_reopen() -> None:
         assert user is not None
         await layer.update_thread(
             "chat-1",
-            name="First Chat",
             user_id=user.id,
             metadata={"model_profile": "local"},
         )
+        await layer.update_thread("chat-1", name="First Chat")
         await layer.create_step.__wrapped__(
             layer,
             {
@@ -81,7 +87,10 @@ async def test_chainlit_history_is_available_after_data_layer_reopen() -> None:
             ("chat-1", "First Chat")
         ]
         assert page.data[0]["steps"][0]["output"] == "hello"
-        assert page.data[0]["metadata"] == {"model_profile": "local"}
+        assert page.data[0]["metadata"] == {
+            "model_profile": "local",
+            CHAT_TITLE_STATE_KEY: CHAT_TITLE_MANUAL,
+        }
         assert page.data[0]["steps"][0]["metadata"] == {}
 
         await reopened.update_step(
@@ -98,6 +107,63 @@ async def test_chainlit_history_is_available_after_data_layer_reopen() -> None:
         restored = await reopened.get_step("message-1")
         assert restored is not None and restored["output"] == "hello"
         await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_generated_chat_title_replaces_and_outlives_chainlit_raw_name(
+    tmp_path: Path,
+) -> None:
+    layer = create_chainlit_data_layer(tmp_path / "chainlit.sqlite3")
+    user = await layer.create_user(User(identifier="local-user", metadata={}))
+    assert user is not None
+
+    await layer.update_thread(
+        "chat-1",
+        name="Первые слова полного пользовательского запроса",
+        user_id=user.id,
+    )
+    initial = await layer.get_thread("chat-1")
+    assert initial is not None
+    assert initial["name"] == "Новый диалог"
+    assert initial["metadata"] == {CHAT_TITLE_STATE_KEY: CHAT_TITLE_PENDING}
+
+    await layer.update_thread("chat-1", metadata={"model_profile": "local"})
+    assert await layer.complete_chat_title("chat-1", "Аудит проекта перед публикацией")
+    await layer.update_thread(
+        "chat-1",
+        name="Поздняя запись сырого запроса",
+        user_id=user.id,
+    )
+    generated = await layer.get_thread("chat-1")
+    assert generated is not None
+    assert generated["name"] == "Аудит проекта перед публикацией"
+    assert generated["metadata"] == {
+        CHAT_TITLE_STATE_KEY: CHAT_TITLE_GENERATED,
+        "model_profile": "local",
+    }
+
+    await layer.update_thread("chat-1", name="Ручное название")
+    renamed = await layer.get_thread("chat-1")
+    assert renamed is not None and renamed["name"] == "Ручное название"
+    assert renamed["metadata"][CHAT_TITLE_STATE_KEY] == CHAT_TITLE_MANUAL
+    await layer.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_rename_wins_over_pending_chat_title(tmp_path: Path) -> None:
+    layer = create_chainlit_data_layer(tmp_path / "chainlit.sqlite3")
+    user = await layer.create_user(User(identifier="local-user", metadata={}))
+    assert user is not None
+    await layer.update_thread("chat-1", name="raw request", user_id=user.id)
+
+    await layer.update_thread("chat-1", name="Моё название")
+    applied = await layer.complete_chat_title("chat-1", "Поздний заголовок модели")
+
+    thread = await layer.get_thread("chat-1")
+    assert applied is False
+    assert thread is not None and thread["name"] == "Моё название"
+    assert thread["metadata"][CHAT_TITLE_STATE_KEY] == CHAT_TITLE_MANUAL
+    await layer.close()
 
 
 @pytest.mark.asyncio

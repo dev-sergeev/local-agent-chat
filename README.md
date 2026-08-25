@@ -5,13 +5,16 @@
 ## Возможности
 
 - OpenAI-compatible Model Profiles из YAML; ключи берутся только из environment.
-- Отдельные файлы, память и SQLite-история для каждого Chat.
-- Shell/Python и файловые инструменты с компактными LLM-заголовками и ограниченными логами.
+- Read-only Agent Mode по умолчанию читает и ищет по абсолютным путям всего диска, но не может изменять файлы или выполнять команды.
+- Extended Agent Mode включается до первого сообщения и добавляет создание, изменение, удаление и команды; после начала Chat режим фиксируется.
+- Отдельные файлы, память и SQLite-история для каждого Chat; Extended Chat также получает собственное Python-окружение.
+- Global Memory по необходимости ищет актуальные Turn прошлых Chat и раскрывает только выбранный ограниченный контекст.
+- Короткие LLM-названия диалогов и вызовов инструментов вместо сырого текста.
 - Работа под URL-префиксом JupyterHub / VS Code Proxy.
 
 ## Быстрый старт
 
-Требуются Python 3.12–3.13 и доступ к OpenAI-compatible API.
+Требуются Python 3.12–3.13 с рабочими `venv`/`ensurepip` (на Debian/Ubuntu — пакет `python3-venv`) и доступ к OpenAI-compatible API.
 
 ```bash
 python -m pip install -e '.[test]'
@@ -35,18 +38,19 @@ export APP_ROOT_PATH="${JUPYTERHUB_SERVICE_PREFIX%/}/vscode/proxy/8765"
 
 | Что | Где |
 | --- | --- |
-| Основной system prompt и prompt LLM-заголовков | [`local_agent_chat/prompts.py`](local_agent_chat/prompts.py) |
+| System prompt агента, названий диалогов и инструментов | [`local_agent_chat/prompts.py`](local_agent_chat/prompts.py) |
 | Стартовые запросы и Chainlit callbacks | `app.py` |
 | Приветствие | `chainlit.md` |
 | Вид tool steps | `local_agent_chat/chainlit_ui.py` |
 | Запуск агента и модели | `local_agent_chat/agent_service.py` |
-| Хранение, revision и Sandbox | `chainlit_data.py`, `runtime.py`, `sandbox_*.py` |
+| Agent Mode и файловые capabilities | `agent_modes.py`, `sandbox_provider.py` |
+| Хранение, Global Memory, revision и Sandbox | `sqlite_history.py`, `memory_tools.py`, `runtime.py`, `sandbox_*.py` |
 
 Термины закреплены в [`CONTEXT.md`](CONTEXT.md), а границы модулей — в [`docs/architecture.md`](docs/architecture.md) и [`docs/adr/`](docs/adr/).
 
 ## Безопасность
 
-`LocalShellBackend` запускает команды с правами процесса приложения. Sandbox — рабочий каталог, а не граница безопасности. Запускайте сервис в отдельном контейнере/VM и только для доверенного одиночного пользователя. Подробности: [`SECURITY.md`](SECURITY.md).
+Read-only не предоставляет Agent инструменты записи и исполнения, но разрешает читать доступные процессу host-файлы. Extended Chat получает собственный `venv`, `HOME`, cache и temp, однако shell и файловые инструменты всё равно работают с правами процесса приложения. Agent Mode не является границей безопасности: используйте отдельный контейнер/VM и только доверенного одиночного пользователя. Подробности: [`SECURITY.md`](SECURITY.md).
 
 ## Разработка
 

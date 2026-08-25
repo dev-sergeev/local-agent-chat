@@ -10,8 +10,13 @@ from langchain_core.messages import AIMessage
 
 import local_agent_chat.agent_service as agent_module
 from local_agent_chat.agent_events import TextDelta, ToolFinished, ToolStarted
+from local_agent_chat.agent_modes import AgentMode
 from local_agent_chat.agent_service import AgentService
+from local_agent_chat.runtime import Turn
+from local_agent_chat.sandbox_files import SandboxFiles
+from local_agent_chat.sandbox_provider import LocalSandboxManager
 from local_agent_chat.settings import ModelProfile
+from local_agent_chat.sqlite_history import SQLiteHistory
 
 
 class ToolAwareFakeModel(FakeMessagesListChatModel):
@@ -28,8 +33,11 @@ class StateSandboxManager:
     def __init__(self) -> None:
         self.value = StateBackend()
 
-    async def backend(self, chat_id: str):
+    async def backend(self, chat_id: str, mode: AgentMode):
         return self.value
+
+    def files_dir(self, chat_id: str) -> Path:
+        return Path("/")
 
     async def push(self, chat_id: str, backend) -> None:
         return None
@@ -94,6 +102,7 @@ async def test_deep_agent_emits_safe_tool_lifecycle_events(
         tmp_path / "checkpoints.sqlite3", (profile,), StateSandboxManager()
     )  # type: ignore[arg-type]
     service.set_profile("chat-1", "test")
+    service.select_mode("chat-1", AgentMode.EXTENDED)
     events = []
 
     async def record(event) -> None:
@@ -174,4 +183,165 @@ async def test_deep_agent_returns_complete_answer_when_streaming_is_disabled(
     assert answer == "non-streamed answer"
     assert not any(isinstance(event, TextDelta) for event in events)
     assert model_kwargs[0]["disable_streaming"] is True
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_read_only_agent_reads_a_global_absolute_path_without_a_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    external = tmp_path / "outside-chat.txt"
+    external.write_text("global host content", encoding="utf-8")
+    fake_model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": str(external)},
+                        "id": "read-global",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="read complete"),
+        ]
+    )
+    monkeypatch.setattr(
+        agent_module, "init_chat_model", lambda *_args, **_kwargs: fake_model
+    )
+    files = SandboxFiles(
+        tmp_path / "sandboxes", max_file_bytes=1024, max_chat_bytes=4096
+    )
+    service = AgentService(
+        tmp_path / "checkpoints.sqlite3",
+        (ModelProfile("test", "Test", "openai:test", "TEST_KEY", "key"),),
+        LocalSandboxManager(files),
+    )
+    service.set_profile("chat-1", "test")
+    events = []
+
+    async def record(event) -> None:
+        events.append(event)
+
+    answer = await service.run("chat-1", "read the absolute file", record)
+
+    assert answer == "read complete"
+    assert any(
+        isinstance(event, ToolFinished) and "global host content" in event.output
+        for event in events
+    )
+    assert not (tmp_path / "sandboxes" / "chat-1" / "environment").exists()
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_read_only_agent_cannot_dispatch_a_forced_write_tool_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "must-not-exist.txt"
+    fake_model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_file",
+                        "args": {"file_path": str(target), "content": "unsafe"},
+                        "id": "forced-write",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="write unavailable"),
+        ]
+    )
+    monkeypatch.setattr(
+        agent_module, "init_chat_model", lambda *_args, **_kwargs: fake_model
+    )
+    files = SandboxFiles(
+        tmp_path / "sandboxes", max_file_bytes=1024, max_chat_bytes=4096
+    )
+    service = AgentService(
+        tmp_path / "checkpoints.sqlite3",
+        (ModelProfile("test", "Test", "openai:test", "TEST_KEY", "key"),),
+        LocalSandboxManager(files),
+    )
+    service.set_profile("chat-1", "test")
+
+    answer = await service.run("chat-1", "try to write")
+
+    assert answer == "write unavailable"
+    assert target.exists() is False
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_read_only_agent_can_search_and_read_global_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    history = SQLiteHistory(tmp_path / "runtime-history.sqlite3")
+    await history.append(
+        Turn(
+            "past-turn",
+            "past-chat",
+            "Решение по индексу памяти",
+            "Использовать локальный SQLite FTS5",
+            "memory",
+            "files",
+        )
+    )
+    fake_model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "search_past_chats",
+                        "args": {"query": "индекс памяти"},
+                        "id": "search-memory",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_past_chat",
+                        "args": {
+                            "chat_id": "past-chat",
+                            "turn_id": "past-turn",
+                            "context_turns": 1,
+                        },
+                        "id": "read-memory",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="В прошлый раз выбрали SQLite FTS5."),
+        ]
+    )
+    monkeypatch.setattr(
+        agent_module, "init_chat_model", lambda *_args, **_kwargs: fake_model
+    )
+    service = AgentService(
+        tmp_path / "checkpoints.sqlite3",
+        (ModelProfile("test", "Test", "openai:test", "TEST_KEY", "key"),),
+        StateSandboxManager(),  # type: ignore[arg-type]
+        global_memory=history,
+    )
+    service.set_profile("current-chat", "test")
+    events = []
+
+    async def record(event) -> None:
+        events.append(event)
+
+    answer = await service.run("current-chat", "Что мы выбрали раньше?", record)
+
+    assert answer == "В прошлый раз выбрали SQLite FTS5."
+    tool_outputs = [event.output for event in events if isinstance(event, ToolFinished)]
+    assert any('"turn_id":"past-turn"' in output for output in tool_outputs)
+    assert any("SQLite FTS5" in output for output in tool_outputs)
     await service.close()

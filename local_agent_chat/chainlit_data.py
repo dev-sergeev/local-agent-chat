@@ -9,6 +9,14 @@ from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 from chainlit.data.storage_clients.base import BaseStorageClient
 from chainlit.data.utils import queue_until_user_message
 
+from .chat_titles import (
+    CHAT_TITLE_FALLBACK,
+    CHAT_TITLE_GENERATED,
+    CHAT_TITLE_MANUAL,
+    CHAT_TITLE_PENDING,
+    CHAT_TITLE_STATE_KEY,
+    DEFAULT_CHAT_TITLE,
+)
 from .tool_logs import format_tool_log
 
 STEP_COLUMNS = [
@@ -43,9 +51,153 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._step_locks: dict[str, asyncio.Lock] = {}
+        self._thread_locks: dict[str, asyncio.Lock] = {}
+        self._initial_name_events: dict[str, asyncio.Event] = {}
 
     def _step_lock(self, step_id: str) -> asyncio.Lock:
         return self._step_locks.setdefault(step_id, asyncio.Lock())
+
+    def _thread_lock(self, thread_id: str) -> asyncio.Lock:
+        return self._thread_locks.setdefault(thread_id, asyncio.Lock())
+
+    async def wait_for_initial_name(self, thread_id: str, timeout: float = 1.0) -> None:
+        """Let Chainlit finish its first-interaction event before replacing its title."""
+
+        event = self._initial_name_events.setdefault(thread_id, asyncio.Event())
+        try:
+            await asyncio.wait_for(event.wait(), timeout)
+        except TimeoutError:
+            return
+        await asyncio.sleep(0)
+
+    async def _chat_title_record(self, thread_id: str) -> tuple[str | None, dict]:
+        rows = await self.execute_sql(
+            query='SELECT name, metadata FROM threads WHERE "id" = :thread_id',
+            parameters={"thread_id": thread_id},
+        )
+        if not isinstance(rows, list) or not rows:
+            return None, {}
+        metadata = rows[0].get("metadata") or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except json.JSONDecodeError:
+                metadata = {}
+        return rows[0].get("name"), metadata
+
+    async def chat_title_state(self, thread_id: str) -> str | None:
+        _name, metadata = await self._chat_title_record(thread_id)
+        state = metadata.get(CHAT_TITLE_STATE_KEY)
+        return str(state) if state else None
+
+    async def begin_chat_title(self, thread_id: str) -> bool:
+        """Claim an unnamed Chat for automatic title generation."""
+
+        async with self._thread_lock(thread_id):
+            name, metadata = await self._chat_title_record(thread_id)
+            state = metadata.get(CHAT_TITLE_STATE_KEY)
+            if state == CHAT_TITLE_PENDING:
+                return name == DEFAULT_CHAT_TITLE
+            if state == CHAT_TITLE_FALLBACK:
+                if name != DEFAULT_CHAT_TITLE:
+                    return False
+                await super().update_thread(
+                    thread_id,
+                    metadata={**metadata, CHAT_TITLE_STATE_KEY: CHAT_TITLE_PENDING},
+                )
+                return True
+            if state is not None:
+                return False
+            await super().update_thread(
+                thread_id,
+                name=DEFAULT_CHAT_TITLE,
+                metadata={CHAT_TITLE_STATE_KEY: CHAT_TITLE_PENDING},
+            )
+            return True
+
+    async def complete_chat_title(
+        self, thread_id: str, title: str, *, fallback: bool = False
+    ) -> bool:
+        """Apply an automatic title only while the placeholder is untouched."""
+
+        state = CHAT_TITLE_FALLBACK if fallback else CHAT_TITLE_GENERATED
+        async with self._thread_lock(thread_id):
+            name, metadata = await self._chat_title_record(thread_id)
+            if (
+                metadata.get(CHAT_TITLE_STATE_KEY) != CHAT_TITLE_PENDING
+                or name != DEFAULT_CHAT_TITLE
+            ):
+                return False
+            await super().update_thread(
+                thread_id,
+                name=title,
+                metadata={CHAT_TITLE_STATE_KEY: state},
+            )
+            return True
+
+    async def first_user_request(self, thread_id: str) -> str | None:
+        rows = await self.execute_sql(
+            query="""SELECT output FROM steps
+                WHERE "threadId" = :thread_id AND type = 'user_message'
+                ORDER BY "createdAt" ASC LIMIT 1""",
+            parameters={"thread_id": thread_id},
+        )
+        if not isinstance(rows, list) or not rows:
+            return None
+        output = rows[0].get("output")
+        return str(output) if output else None
+
+    async def has_user_request(self, thread_id: str) -> bool:
+        rows = await self.execute_sql(
+            query="""SELECT 1 AS present FROM steps
+                WHERE "threadId" = :thread_id AND type = 'user_message'
+                LIMIT 1""",
+            parameters={"thread_id": thread_id},
+        )
+        return isinstance(rows, list) and bool(rows)
+
+    async def update_thread(
+        self,
+        thread_id,
+        name=None,
+        user_id=None,
+        metadata=None,
+        tags=None,
+    ):
+        is_initial_name = name is not None and user_id is not None
+        async with self._thread_lock(thread_id):
+            _stored_name, stored_metadata = await self._chat_title_record(thread_id)
+            title_state = stored_metadata.get(CHAT_TITLE_STATE_KEY)
+            if is_initial_name:
+                # Chainlit supplies the raw first request as name. Store a neutral
+                # placeholder and let the bounded title task replace it later.
+                if title_state in {
+                    CHAT_TITLE_GENERATED,
+                    CHAT_TITLE_FALLBACK,
+                    CHAT_TITLE_MANUAL,
+                }:
+                    name = None
+                else:
+                    name = DEFAULT_CHAT_TITLE
+                    metadata = {
+                        **(metadata or {}),
+                        CHAT_TITLE_STATE_KEY: CHAT_TITLE_PENDING,
+                    }
+            elif name is not None:
+                # Public name-only updates come from Chainlit's manual rename API.
+                metadata = {
+                    **(metadata or {}),
+                    CHAT_TITLE_STATE_KEY: CHAT_TITLE_MANUAL,
+                }
+            await super().update_thread(
+                thread_id,
+                name=name,
+                user_id=user_id,
+                metadata=metadata,
+                tags=tags,
+            )
+            if is_initial_name:
+                self._initial_name_events.setdefault(thread_id, asyncio.Event()).set()
 
     @queue_until_user_message()
     async def create_step(self, step_dict):
@@ -173,9 +325,11 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
         await self.commit_revision(root_id)
 
     async def delete_thread(self, thread_id: str):
-        await super().delete_thread(thread_id)
         if self.chat_cleanup is not None:
             await self.chat_cleanup(thread_id)
+        await super().delete_thread(thread_id)
+        self._thread_locks.pop(thread_id, None)
+        self._initial_name_events.pop(thread_id, None)
 
 
 SCHEMA = """

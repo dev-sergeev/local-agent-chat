@@ -31,13 +31,25 @@ def test_tool_display_uses_human_labels_and_short_context() -> None:
     )
     read = tool_display("read_file", '{"file_path": "src/agent.py"}')
 
-    assert shell.title == "Выполняю системную команду"
+    assert shell.title == "Выполнение системной команды"
     assert shell.icon == "terminal"
     assert shell.show_input == "bash"
     assert shell.input == "python -m pytest tests/test_runtime.py -q"
     assert read.title == "Чтение файла · src/agent.py"
     assert read.icon == "file-text"
     assert read.input == '{\n  "file_path": "src/agent.py"\n}'
+
+
+def test_tool_display_names_global_memory_actions() -> None:
+    search = tool_display(
+        "search_past_chats", '{"query":"решение по глобальной памяти"}'
+    )
+    read = tool_display("read_past_chat", '{"chat_id":"chat-42","turn_id":"turn-7"}')
+
+    assert search.title == ("Поиск в прошлых диалогах · решение по глобальной памяти")
+    assert search.icon == "history"
+    assert read.title == "Контекст прошлого диалога · chat-42"
+    assert read.icon == "book-open-text"
 
 
 def test_answer_mentions_side_panel_files() -> None:
@@ -120,7 +132,7 @@ async def test_shell_tool_title_is_replaced_by_llm_summary(monkeypatch) -> None:
             self.output = ""
 
         async def send(self):
-            assert self.name == "Выполняю системную команду"
+            assert self.name == "Выполнение системной команды"
 
         async def update(self):
             updates.append(self.name)
@@ -128,7 +140,7 @@ async def test_shell_tool_title_is_replaced_by_llm_summary(monkeypatch) -> None:
     async def title_resolver(name: str, input_text: str) -> str | None:
         assert name == "execute"
         assert input_text == '{"command":"whoami; uname -a"}'
-        return "Изучаю параметры рабочей системы"
+        return "Проверка пользователя и версии ядра"
 
     monkeypatch.setattr(chainlit_ui.cl, "Step", FakeStep)
     monkeypatch.setattr(chainlit_ui, "utc_now", lambda: "now")
@@ -140,7 +152,7 @@ async def test_shell_tool_title_is_replaced_by_llm_summary(monkeypatch) -> None:
     )
     await view.finish_tool_titles()
 
-    assert updates == ["Изучаю параметры рабочей системы"]
+    assert updates == ["Проверка пользователя и версии ядра"]
 
 
 @pytest.mark.asyncio
@@ -286,7 +298,7 @@ async def test_ordered_event_timeline_survives_chainlit_history_reload(
 
     async def title_resolver(name: str, _input_text: str) -> str | None:
         if name == "execute":
-            return "Изучаю содержимое рабочего каталога"
+            return "Проверка содержимого рабочего каталога"
         return None
 
     async with Step(name="on_message", type="run") as turn:
@@ -350,7 +362,7 @@ async def test_ordered_event_timeline_survives_chainlit_history_reload(
     ]
     assert all(step["parentId"] == turn.id for step in steps)
     assert next(step["name"] for step in steps if step["id"] == "ls") == (
-        "Изучаю содержимое рабочего каталога"
+        "Проверка содержимого рабочего каталога"
     )
     await reopened.close()
 

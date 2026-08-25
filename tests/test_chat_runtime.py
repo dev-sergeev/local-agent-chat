@@ -185,6 +185,65 @@ class ChatRuntimeTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(KeyError):
                 await reopened.get("turn-2")
 
+    async def test_sqlite_history_reports_whether_chat_has_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            history = SQLiteHistory(Path(directory) / "history.sqlite3")
+
+            self.assertFalse(await history.has_chat("chat-1"))
+            await history.append(
+                Turn("turn-1", "chat-1", "request", "answer", "memory", "files")
+            )
+            self.assertTrue(await history.has_chat("chat-1"))
+
+    async def test_delete_waits_for_pre_run_and_post_run_transaction_stages(
+        self,
+    ) -> None:
+        agent = RecordingAgent()
+        snapshot_started = asyncio.Event()
+        release_snapshot = asyncio.Event()
+        append_started = asyncio.Event()
+        release_append = asyncio.Event()
+        cleanup_called = asyncio.Event()
+
+        class BlockingSandbox(RecordingSandbox):
+            async def snapshot(self, chat_id: str) -> str:
+                snapshot_started.set()
+                await release_snapshot.wait()
+                return await super().snapshot(chat_id)
+
+        class BlockingHistory(InMemoryHistory):
+            async def append(self, turn: Turn) -> None:
+                append_started.set()
+                await release_append.wait()
+                await super().append(turn)
+
+        history = BlockingHistory(agent.events)
+        runtime = ChatRuntime(
+            agent=agent,
+            sandbox=BlockingSandbox(agent.events),
+            history=history,
+        )
+        running = asyncio.create_task(runtime.submit("chat-1", "turn-1", "request"))
+        await snapshot_started.wait()
+
+        async def cleanup() -> None:
+            cleanup_called.set()
+
+        deleting = asyncio.create_task(runtime.delete_chat("chat-1", cleanup))
+        await asyncio.sleep(0)
+        self.assertFalse(deleting.done())
+        release_snapshot.set()
+        await append_started.wait()
+        self.assertFalse(deleting.done())
+        self.assertFalse(cleanup_called.is_set())
+        release_append.set()
+
+        self.assertEqual(await running, "answer:request")
+        await deleting
+        self.assertTrue(cleanup_called.is_set())
+        with self.assertRaisesRegex(RuntimeError, "being deleted"):
+            await runtime.submit("chat-1", "turn-2", "later")
+
 
 if __name__ == "__main__":
     unittest.main()

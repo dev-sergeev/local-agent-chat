@@ -3,6 +3,26 @@ from __future__ import annotations
 import re
 
 _LABEL_PREFIX = re.compile(r"^(?:заголовок|название)\s*:\s*", re.IGNORECASE)
+_FIRST_PERSON_OPENERS = frozenset(
+    {
+        "анализирую",
+        "выполняю",
+        "изучаю",
+        "ищу",
+        "обновляю",
+        "проверяю",
+        "получаю",
+        "просматриваю",
+        "редактирую",
+        "создаю",
+        "смотрю",
+        "устанавливаю",
+        "удаляю",
+        "читаю",
+        "записываю",
+        "запускаю",
+    }
+)
 
 
 def normalize_tool_title(value: str) -> str | None:
@@ -13,5 +33,8 @@ def normalize_tool_title(value: str) -> str | None:
     plain = _LABEL_PREFIX.sub("", plain).strip(" \t\"'«»*#.:;!?—–-")
     words = plain.split()
     if len(words) < 3:
+        return None
+    first_word = words[0].strip(" \t\"'«»*#.:;!?—–-").casefold()
+    if first_word == "я" or first_word in _FIRST_PERSON_OPENERS:
         return None
     return " ".join(words[:5]).strip(" \t\"'«»*#.:;!?—–-") or None

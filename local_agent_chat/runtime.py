@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -43,8 +44,11 @@ class ChatRuntime:
         self._sandbox = sandbox
         self._history = history
         self._locks: dict[str, asyncio.Lock] = {}
+        self._deleting: set[str] = set()
 
     def _enter_chat(self, chat_id: str) -> asyncio.Lock:
+        if chat_id in self._deleting:
+            raise RuntimeError("Chat is being deleted")
         lock = self._locks.setdefault(chat_id, asyncio.Lock())
         if lock.locked():
             raise RuntimeError("Another Turn is already running for this Chat")
@@ -65,6 +69,8 @@ class ChatRuntime:
         emit: EventSink | None = None,
     ) -> str:
         async with self._enter_chat(chat_id):
+            if chat_id in self._deleting:
+                raise RuntimeError("Chat is being deleted")
             memory = await self._agent.checkpoint(chat_id)
             files = await self._sandbox.snapshot(chat_id)
             try:
@@ -92,6 +98,8 @@ class ChatRuntime:
         emit: EventSink | None = None,
     ) -> str:
         async with self._enter_chat(chat_id):
+            if chat_id in self._deleting:
+                raise RuntimeError("Chat is being deleted")
             original = await self._history.get(turn_id)
             if original.chat_id != chat_id:
                 raise ValueError("Turn does not belong to Chat")
@@ -115,3 +123,12 @@ class ChatRuntime:
             )
             await self._history.replace_from(turn_id, replacement)
             return answer
+
+    async def delete_chat(
+        self, chat_id: str, cleanup: Callable[[], Awaitable[None]]
+    ) -> None:
+        """Block new Turns and run cleanup after the active transaction finishes."""
+
+        self._deleting.add(chat_id)
+        async with self._locks.setdefault(chat_id, asyncio.Lock()):
+            await cleanup()

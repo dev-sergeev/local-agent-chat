@@ -77,11 +77,19 @@ def tool_display(name: str, input_text: str) -> ToolDisplay:
         return ToolDisplay(
             f"Список файлов{suffix}", "list-tree", "json", rendered_input
         )
+    if name == "search_past_chats":
+        query = _short(data.get("query"))
+        title = "Поиск в прошлых диалогах" + (f" · {query}" if query else "")
+        return ToolDisplay(title, "history", "json", rendered_input)
+    if name == "read_past_chat":
+        source = _short(data.get("chat_id") or data.get("turn_id"))
+        title = "Контекст прошлого диалога" + (f" · {source}" if source else "")
+        return ToolDisplay(title, "book-open-text", "json", rendered_input)
     if name in {"glob", "grep", "search"}:
         return ToolDisplay(f"Поиск по файлам{suffix}", "search", "json", rendered_input)
     if name in _SHELL_TOOLS:
         return ToolDisplay(
-            "Выполняю системную команду",
+            "Выполнение системной команды",
             "terminal",
             "bash",
             _shell_input(data, input_text),
