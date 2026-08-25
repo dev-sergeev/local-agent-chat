@@ -16,7 +16,8 @@ class SettingsTest(unittest.TestCase):
                 "  - id: local\n"
                 "    label: Local model\n"
                 "    model: openai-compatible:local\n"
-                "    api_key_env: LOCAL_MODEL_KEY\n",
+                "    api_key_env: LOCAL_MODEL_KEY\n"
+                "    streaming: false\n",
                 encoding="utf-8",
             )
             env = {
@@ -33,6 +34,7 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.root_path, "/user/alice/vscode/proxy/8000")
         self.assertEqual(settings.models[0].id, "local")
         self.assertEqual(settings.models[0].api_key, "secret-value")
+        self.assertFalse(settings.models[0].streaming)
         self.assertNotIn("secret-value", yaml_text)
 
 

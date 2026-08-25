@@ -16,6 +16,7 @@ class ModelProfile:
     api_key_env: str
     api_key: str | None
     base_url: str | None = None
+    streaming: bool = True
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ def load_settings() -> Settings:
             api_key_env=item["api_key_env"],
             api_key=os.environ.get(item["api_key_env"]),
             base_url=item.get("base_url"),
+            streaming=item.get("streaming", True),
         )
         for item in document.get("models", [])
     )

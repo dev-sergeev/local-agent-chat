@@ -6,6 +6,7 @@
 - Browser-side DELETE requests with JSON bodies are tunneled as POST across Jupyter Server Proxy and restored to DELETE by a narrow ASGI middleware before Chainlit routing.
 - A silent, fixed Local User identity enables Chainlit's built-in history without a login form.
 - Each new Chat selects one Model Profile loaded from YAML. Provider secrets come only from environment variables.
+- A Model Profile may set `streaming: false`; LangChain then routes event streaming through the model's complete `ainvoke` result, and the UI renders that final answer without text deltas.
 - One Turn per Chat may run at a time; concurrent submissions are rejected.
 - Deep Agents emits typed text/tool events through `ChatRuntime`; a Chainlit-only adapter persists text segments and tool Steps as one ordered sibling timeline inside the Turn. A new text segment starts after every tool so live rendering and resumed Chat History keep the same chronology.
 - Tool input is rendered according to its type (a shell command is Bash, structured file arguments are JSON). Tool output is sanitized and persisted as a bounded preformatted text log so terminal text cannot be interpreted as chat Markdown.

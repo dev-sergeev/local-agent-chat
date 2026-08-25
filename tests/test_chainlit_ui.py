@@ -50,6 +50,37 @@ def test_answer_mentions_side_panel_files() -> None:
 
 
 @pytest.mark.asyncio
+async def test_complete_renders_answer_without_streamed_text(monkeypatch) -> None:
+    sent = []
+
+    class FakeRoot:
+        end = None
+        output = ""
+
+        async def update(self):
+            return None
+
+    class FakeMessage:
+        def __init__(self, content="", **kwargs):
+            self.content = content
+            self.metadata = kwargs.get("metadata", {})
+            self.elements = []
+
+        async def send(self):
+            sent.append(self)
+
+    monkeypatch.setattr(chainlit_ui.cl, "Message", FakeMessage)
+    monkeypatch.setattr(chainlit_ui, "utc_now", lambda: "now")
+    view = ChainlitTurnView()
+    view.root = FakeRoot()
+
+    await view.complete("non-streamed answer", elements=[], file_names=[])
+
+    assert [message.content for message in sent] == ["non-streamed answer"]
+    assert sent[0].metadata["event_kind"] == "assistant_final"
+
+
+@pytest.mark.asyncio
 async def test_tool_step_is_collapsed_from_its_first_render(monkeypatch) -> None:
     initial_state = {}
 

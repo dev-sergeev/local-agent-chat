@@ -137,3 +137,41 @@ async def test_deep_agent_streams_public_answer_text(
     assert answer == "streamed"
     assert "".join(deltas) == "streamed"
     await service.close()
+
+
+@pytest.mark.asyncio
+async def test_deep_agent_returns_complete_answer_when_streaming_is_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_model = StreamingToolAwareFakeModel(responses=["non-streamed answer"])
+    model_kwargs = []
+
+    def fake_init_chat_model(*args, **kwargs):
+        model_kwargs.append(kwargs)
+        fake_model.disable_streaming = kwargs.get("disable_streaming", False)
+        return fake_model
+
+    monkeypatch.setattr(agent_module, "init_chat_model", fake_init_chat_model)
+    profile = ModelProfile(
+        "test",
+        "Test",
+        "openai:test",
+        "TEST_KEY",
+        "key",
+        streaming=False,
+    )
+    service = AgentService(
+        tmp_path / "checkpoints.sqlite3", (profile,), StateSandboxManager()
+    )  # type: ignore[arg-type]
+    service.set_profile("chat-1", "test")
+    events = []
+
+    async def record(event) -> None:
+        events.append(event)
+
+    answer = await service.run("chat-1", "answer", record)
+
+    assert answer == "non-streamed answer"
+    assert not any(isinstance(event, TextDelta) for event in events)
+    assert model_kwargs[0]["disable_streaming"] is True
+    await service.close()

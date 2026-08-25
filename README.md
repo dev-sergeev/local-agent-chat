@@ -29,6 +29,7 @@ export APP_ROOT_PATH="${JUPYTERHUB_SERVICE_PREFIX%/}/vscode/proxy/8765"
 ```
 
 Основные настройки: `models.yaml` — модели, `.env` — секреты и пути, `.chainlit/config.toml` — UI. Примеры: `models.example.yaml` и `.env.example`.
+Если модель не поддерживает streaming, добавьте в её профиль `streaming: false`: UI покажет полный ответ после завершения вызова.
 
 ## Где менять проект
 

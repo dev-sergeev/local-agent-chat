@@ -132,6 +132,8 @@ class AgentService:
             kwargs["api_key"] = profile.api_key
         if profile.base_url:
             kwargs["base_url"] = profile.base_url
+        if not profile.streaming:
+            kwargs["disable_streaming"] = True
         model = init_chat_model(profile.model, **kwargs)
         backend = await self._sandboxes.backend(chat_id)
         graph = create_deep_agent(
