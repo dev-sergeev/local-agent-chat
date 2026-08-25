@@ -50,9 +50,7 @@ class ChatRuntime:
             raise RuntimeError("Another Turn is already running for this Chat")
         return lock
 
-    async def _restore_state(
-        self, chat_id: str, memory: str, files: str
-    ) -> None:
+    async def _restore_state(self, chat_id: str, memory: str, files: str) -> None:
         async def restore() -> None:
             await self._agent.restore(chat_id, memory)
             await self._sandbox.restore(chat_id, files)

@@ -70,9 +70,7 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
                     and not metadata.get("tool_log_format")
                     and step.get("output")
                 ):
-                    step["output"] = format_tool_log(
-                        str(step["output"]), limit=6000
-                    )
+                    step["output"] = format_tool_log(str(step["output"]), limit=6000)
                     metadata["tool_log_format"] = 1
                     step["metadata"] = metadata
         return threads

@@ -3,11 +3,14 @@
 ## Runtime
 
 - Chainlit serves the UI under `APP_ROOT_PATH`, supplied to `chainlit run --root-path` behind Jupyter Server Proxy.
+- Browser-side DELETE requests with JSON bodies are tunneled as POST across Jupyter Server Proxy and restored to DELETE by a narrow ASGI middleware before Chainlit routing.
 - A silent, fixed Local User identity enables Chainlit's built-in history without a login form.
 - Each new Chat selects one Model Profile loaded from YAML. Provider secrets come only from environment variables.
 - One Turn per Chat may run at a time; concurrent submissions are rejected.
 - Deep Agents emits typed text/tool events through `ChatRuntime`; a Chainlit-only adapter persists text segments and tool Steps as one ordered sibling timeline inside the Turn. A new text segment starts after every tool so live rendering and resumed Chat History keep the same chronology.
 - Tool input is rendered according to its type (a shell command is Bash, structured file arguments are JSON). Tool output is sanitized and persisted as a bounded preformatted text log so terminal text cannot be interpreted as chat Markdown.
+- Shell Steps never expose the raw command in their title. A separate bounded call to the Chat's Model Profile asynchronously replaces the neutral initial title with a three-to-five-word Russian description of the command's purpose; invalid, failed, or timed-out descriptions retain the neutral fallback and never fail the Turn.
+- Tool Steps are collapsed on their first render and are never auto-collapsed later, preventing layout jumps while preserving manual expansion; failed Steps remain marked as errors.
 - Cancelling a Turn restores its pre-turn Agent Memory and Sandbox snapshot before another Turn can start.
 
 ## Persistence
@@ -21,10 +24,11 @@
 
 ## Agent execution
 
-- Deep Agents runs outside the Sandbox and retains model credentials outside it.
+- Agent and tool-title system prompts are centralized in `local_agent_chat/prompts.py`.
+- Deep Agents runs in the application process; model credentials are not injected into the command environment.
 - A local adapter supplies filesystem tools and Python/shell execution.
 - The local adapter keeps one command backend in memory per Chat and roots file operations in that Chat's Sandbox directory.
-- Commands receive a minimal environment without application or model credentials. The Docker container is their isolation boundary.
+- Commands receive a minimal environment but execute on the application host with the application's permissions. The deployment must provide a dedicated container or VM as the actual isolation boundary.
 
 ## Revision
 

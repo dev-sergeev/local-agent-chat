@@ -18,9 +18,7 @@ class RecordingAgent:
     async def restore(self, chat_id: str, checkpoint: str) -> None:
         self.events.append(("restore-memory", checkpoint))
 
-    async def run(
-        self, chat_id: str, text: str, emit: EventSink | None = None
-    ) -> str:
+    async def run(self, chat_id: str, text: str, emit: EventSink | None = None) -> str:
         self.events.append(("run", text))
         if emit is not None:
             await emit(TextDelta(f"answer:{text}"))
@@ -77,9 +75,7 @@ class ChatRuntimeTest(unittest.IsolatedAsyncioTestCase):
         started = asyncio.Event()
         release = asyncio.Event()
 
-        async def wait(
-            chat_id: str, text: str, emit: EventSink | None = None
-        ) -> str:
+        async def wait(chat_id: str, text: str, emit: EventSink | None = None) -> str:
             started.set()
             await release.wait()
             return "done"
@@ -124,9 +120,7 @@ class ChatRuntimeTest(unittest.IsolatedAsyncioTestCase):
         )
         await runtime.submit("chat-1", "turn-1", "original")
 
-        async def fail(
-            chat_id: str, text: str, emit: EventSink | None = None
-        ) -> str:
+        async def fail(chat_id: str, text: str, emit: EventSink | None = None) -> str:
             raise RuntimeError("model failed")
 
         agent.run = fail  # type: ignore[method-assign]
@@ -145,9 +139,7 @@ class ChatRuntimeTest(unittest.IsolatedAsyncioTestCase):
         runtime = ChatRuntime(agent=agent, sandbox=sandbox, history=history)
         seen: list[TextDelta] = []
 
-        async def cancel(
-            chat_id: str, text: str, emit: EventSink | None = None
-        ) -> str:
+        async def cancel(chat_id: str, text: str, emit: EventSink | None = None) -> str:
             if emit is not None:
                 await emit(TextDelta("partial"))
             raise asyncio.CancelledError

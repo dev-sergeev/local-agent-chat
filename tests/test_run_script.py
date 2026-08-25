@@ -43,3 +43,5 @@ def test_run_script_loads_and_exports_dotenv_itself(tmp_path: Path) -> None:
         "a-test-secret-that-is-at-least-32-characters", "<REDACTED>"
     )
     assert "--port 8765 --root-path /user/test/vscode/proxy/8765" in result.stdout
+    assert "--host 127.0.0.1" in result.stdout
+    assert "--headless" in result.stdout

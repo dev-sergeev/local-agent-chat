@@ -132,7 +132,10 @@ cot = "tool_call"
 
 # Specify a JavaScript file that can be used to customize the user interface.
 # The JavaScript file can be served from the public directory.
-# custom_js = "/public/test.js"
+# Jupyter Server Proxy cannot forward a DELETE request carrying a body through
+# Tornado's default HTTP client. Tunnel such requests as POST at the browser
+# boundary; the ASGI middleware restores DELETE before Chainlit routing.
+custom_js = "/public/proxy-method-override.js"
 
 # The style of alert boxes. Can be "classic" or "modern".
 alert_style = "modern"

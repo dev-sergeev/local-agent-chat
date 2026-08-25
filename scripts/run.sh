@@ -20,8 +20,9 @@ fi
 : "${MODEL_PROFILES_FILE:=models.yaml}"
 : "${APP_DATA_DIR:=.local-agent-chat}"
 : "${APP_ROOT_PATH:=}"
+: "${APP_HOST:=127.0.0.1}"
 : "${APP_PORT:=8765}"
 
-export CHAINLIT_AUTH_SECRET MODEL_PROFILES_FILE APP_DATA_DIR APP_ROOT_PATH APP_PORT
+export CHAINLIT_AUTH_SECRET MODEL_PROFILES_FILE APP_DATA_DIR APP_ROOT_PATH APP_HOST APP_PORT
 cd "$PROJECT_ROOT"
-exec chainlit run app.py --host 0.0.0.0 --port "$APP_PORT" --root-path "$APP_ROOT_PATH"
+exec chainlit run app.py --headless --host "$APP_HOST" --port "$APP_PORT" --root-path "$APP_ROOT_PATH"

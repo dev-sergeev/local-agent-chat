@@ -1,50 +1,63 @@
 # Local Agent Chat
 
-Chainlit UI для Deep Agents в JupyterHub. Поддерживаются URL-префикс, тихая локальная идентификация без формы входа, SQLite-история, возобновление чатов, Model Profile на Chat, файлы, локальные Python/shell-команды и нативный Revision.
+Однопользовательский Chainlit UI для Deep Agents в JupyterHub: история чатов, возобновление после перезапуска, файлы, revision с откатом состояния и наблюдаемые tool calls.
 
-Интерфейс показывает единый хронологический поток текста и наблюдаемых шагов Agent: чтение и изменение файлов, поиск, shell/Python, подзадачи, результаты и ошибки. Каждый текстовый фрагмент после инструмента сохраняется отдельно, поэтому после перезагрузки объяснения, ошибки и следующие вызовы остаются в исходном порядке. Вывод инструментов отображается как моноширинный preformatted log: переносы строк сохраняются, ANSI-коды удаляются, а при сокращении длинного результата остаются его начало и конец. Успешные шаги автоматически сворачиваются, ошибки остаются раскрытыми, а Stop отменяет Turn и восстанавливает pre-turn состояние. Созданные изображения показываются inline, остальные файлы доступны из боковой панели и сохраняются в истории.
+## Возможности
 
-## Установка
+- OpenAI-compatible Model Profiles из YAML; ключи берутся только из environment.
+- Отдельные файлы, память и SQLite-история для каждого Chat.
+- Shell/Python и файловые инструменты с компактными LLM-заголовками и ограниченными логами.
+- Работа под URL-префиксом JupyterHub / VS Code Proxy.
+
+## Быстрый старт
+
+Требуются Python 3.12–3.13 и доступ к OpenAI-compatible API.
 
 ```bash
 python -m pip install -e '.[test]'
 cp models.example.yaml models.yaml
 cp .env.example .env
-```
-
-По умолчанию настроена OpenAI-compatible модель `deepseek/deepseek-v4-flash-0731` через OpenRouter. Model Profile хранится в `models.yaml`, а endpoint и ключ — в `.env` как `OPENAI_BASE_URL` и `OPENAI_API_KEY`.
-
-```bash
-export CHAINLIT_AUTH_SECRET="$(openssl rand -hex 32)"
-```
-
-Chainlit автоматически идентифицирует фиксированного Local User через header-auth: формы логина нет, но встроенная история доступна. Для каждого Chat создаётся отдельный локальный каталог Sandbox, а backend хранится в памяти процесса. Python и shell-команды выполняются в Docker-контейнере с этим каталогом в качестве рабочей директории; ключи моделей в окружение команд не передаются.
-
-## Запуск через JupyterHub
-
-```bash
-export APP_PORT=8765
-export APP_ROOT_PATH="${JUPYTERHUB_SERVICE_PREFIX%/}/vscode/proxy/$APP_PORT"
+# Укажите OPENAI_API_KEY и случайный CHAINLIT_AUTH_SECRET в .env
 ./scripts/run.sh
 ```
 
-Открывайте приложение по адресу `${APP_ROOT_PATH}/` на внешнем адресе VS Code/JupyterHub. Публичный путь должен совпадать с Chainlit `--root-path` и указываться без завершающего `/`. VS Code proxy удаляет `/proxy/$APP_PORT` перед передачей запроса; встроенный ASGI-адаптер восстанавливает этот префикс для HTTP и WebSocket. Для прямого запуска без JupyterHub оставьте `APP_ROOT_PATH` пустым.
+По умолчанию UI доступен на `http://127.0.0.1:8765`. Для JupyterHub:
 
-Путь находится под защитой самого JupyterHub, поэтому пользователь без активной Hub-сессии увидит его форму входа. Авторизация внутри Chainlit при этом остается отключенной.
+```bash
+export APP_ROOT_PATH="${JUPYTERHUB_SERVICE_PREFIX%/}/vscode/proxy/8765"
+./scripts/run.sh
+```
 
-## Хранилища
+Основные настройки: `models.yaml` — модели, `.env` — секреты и пути, `.chainlit/config.toml` — UI. Примеры: `models.example.yaml` и `.env.example`.
 
-- `chainlit.sqlite3` — UI Threads, Steps и метаданные.
-- `checkpoints.sqlite3` — LangGraph checkpoints и активная ветка.
-- `runtime-history.sqlite3` — Turn и audit superseded-веток.
-- `sandboxes/` — Uploaded File и pre-turn snapshots.
-- `blobs/` — элементы Chainlit для возобновлённого Chat.
+## Где менять проект
 
-Revision архивирует UI-ветку, восстанавливает checkpoint и снимок файлов, повторно запускает Agent и после успеха заменяет активную runtime-историю. При ошибке восстанавливаются прежние UI Steps, Agent Memory и Sandbox.
+| Что | Где |
+| --- | --- |
+| Основной system prompt и prompt LLM-заголовков | [`local_agent_chat/prompts.py`](local_agent_chat/prompts.py) |
+| Стартовые запросы и Chainlit callbacks | `app.py` |
+| Приветствие | `chainlit.md` |
+| Вид tool steps | `local_agent_chat/chainlit_ui.py` |
+| Запуск агента и модели | `local_agent_chat/agent_service.py` |
+| Хранение, revision и Sandbox | `chainlit_data.py`, `runtime.py`, `sandbox_*.py` |
 
-## Проверка
+Термины закреплены в [`CONTEXT.md`](CONTEXT.md), а границы модулей — в [`docs/architecture.md`](docs/architecture.md) и [`docs/adr/`](docs/adr/).
+
+## Безопасность
+
+`LocalShellBackend` запускает команды с правами процесса приложения. Sandbox — рабочий каталог, а не граница безопасности. Запускайте сервис в отдельном контейнере/VM и только для доверенного одиночного пользователя. Подробности: [`SECURITY.md`](SECURITY.md).
+
+## Разработка
 
 ```bash
 pytest -q
+ruff check .
+ruff format --check .
 python -m compileall -q local_agent_chat app.py
 ```
+
+Правила и PR-checklist: [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Лицензия
+
+[MIT](LICENSE).

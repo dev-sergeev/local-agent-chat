@@ -22,8 +22,10 @@ from .agent_events import (
     public_text,
     safe_text,
 )
+from .prompts import AGENT_SYSTEM_PROMPT, TOOL_TITLE_SYSTEM_PROMPT
 from .sandbox_provider import LocalSandboxManager
 from .settings import ModelProfile
+from .tool_titles import normalize_tool_title
 
 
 class AgentService:
@@ -39,6 +41,7 @@ class AgentService:
         self._connection: aiosqlite.Connection | None = None
         self._saver: AsyncSqliteSaver | None = None
         self._graphs: dict[str, Any] = {}
+        self._tool_title_models: dict[str, Any] = {}
         self._profiles: dict[str, str] = {}
         self._namespaces: dict[str, str] = {}
         self._pending_restore: dict[str, dict[str, Any]] = {}
@@ -81,6 +84,45 @@ class AgentService:
     def profile_for(self, chat_id: str) -> str | None:
         return self._profiles.get(chat_id)
 
+    async def describe_tool(
+        self, chat_id: str, name: str, input_text: str
+    ) -> str | None:
+        """Generate a compact label without affecting the agent's main run."""
+
+        profile_id = self._profiles.get(chat_id)
+        if profile_id is None:
+            return None
+        profile = self._models[profile_id]
+        model = self._tool_title_models.get(profile_id)
+        if model is None:
+            kwargs: dict[str, Any] = {
+                "max_tokens": 32,
+                "reasoning_effort": "none",
+            }
+            if profile.api_key:
+                kwargs["api_key"] = profile.api_key
+            if profile.base_url:
+                kwargs["base_url"] = profile.base_url
+            model = init_chat_model(profile.model, **kwargs)
+            self._tool_title_models[profile_id] = model
+        payload = safe_text(input_text, max_chars=2000)
+        try:
+            response = await asyncio.wait_for(
+                model.ainvoke(
+                    [
+                        ("system", TOOL_TITLE_SYSTEM_PROMPT),
+                        (
+                            "user",
+                            f"Инструмент: {name}\n<tool-input>\n{payload}\n</tool-input>",
+                        ),
+                    ]
+                ),
+                timeout=10,
+            )
+        except Exception:  # noqa: BLE001 - a cosmetic label must never fail a Turn
+            return None
+        return normalize_tool_title(message_text(response))
+
     async def _graph(self, chat_id: str):
         if chat_id in self._graphs:
             return self._graphs[chat_id]
@@ -96,10 +138,7 @@ class AgentService:
             model=model,
             backend=backend,
             checkpointer=await self._checkpointer(),
-            system_prompt=(
-                "You are a local agent. Work only in the current Sandbox directory. "
-                "Use relative paths for shell and Python commands. Never request or expose credentials."
-            ),
+            system_prompt=AGENT_SYSTEM_PROMPT,
         )
         self._graphs[chat_id] = graph
         return graph
@@ -140,9 +179,7 @@ class AgentService:
             }
             self.set_profile(chat_id, self._profiles[chat_id])
 
-    async def run(
-        self, chat_id: str, text: str, emit: EventSink | None = None
-    ) -> str:
+    async def run(self, chat_id: str, text: str, emit: EventSink | None = None) -> str:
         async with self._locks.setdefault(chat_id, asyncio.Lock()):
             graph = await self._graph(chat_id)
             backend = await self._sandboxes.backend(chat_id)

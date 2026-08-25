@@ -8,6 +8,11 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 *.egg-info/
+build/
+dist/
+*.whl
 *.pyc
+.coverage
+htmlcov/
 Screenshot*.png
 .DS_Store

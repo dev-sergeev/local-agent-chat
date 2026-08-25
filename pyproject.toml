@@ -5,6 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "local-agent-chat"
 version = "0.1.0"
+description = "Single-user Chainlit UI for persistent Deep Agents in JupyterHub"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.14"
 dependencies = [
   "chainlit>=2.11,<2.12",
@@ -19,7 +23,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff>=0.13,<1"]
+test = [
+  "pytest>=8,<10",
+  "pytest-asyncio>=1,<2",
+  "requests>=2,<3",
+  "ruff>=0.13,<1",
+]
 
 [tool.setuptools.packages.find]
 include = ["local_agent_chat*"]
@@ -27,3 +36,9 @@ include = ["local_agent_chat*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

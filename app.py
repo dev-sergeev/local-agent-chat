@@ -15,7 +15,10 @@ from local_agent_chat.agent_service import AgentService
 from local_agent_chat.chainlit_data import create_chainlit_data_layer
 from local_agent_chat.chainlit_ui import ChainlitTurnView
 from local_agent_chat.local_storage import LocalStorageClient
-from local_agent_chat.proxy_prefix import RestoreProxyPrefixMiddleware
+from local_agent_chat.proxy_prefix import (
+    RestoreProxyMethodMiddleware,
+    RestoreProxyPrefixMiddleware,
+)
 from local_agent_chat.runtime import ChatRuntime
 from local_agent_chat.sandbox_files import SandboxFiles
 from local_agent_chat.sandbox_provider import LocalSandboxManager
@@ -24,6 +27,7 @@ from local_agent_chat.sqlite_history import SQLiteHistory
 
 settings = load_settings()
 app.add_middleware(RestoreProxyPrefixMiddleware, prefix=settings.root_path)
+app.add_middleware(RestoreProxyMethodMiddleware)
 settings.data_dir.mkdir(parents=True, exist_ok=True)
 storage = LocalStorageClient(settings.data_dir / "blobs", f"{settings.root_path}/files")
 chainlit_layer = create_chainlit_data_layer(
@@ -188,7 +192,10 @@ async def on_message(message: cl.Message):
         await chainlit_layer.wait_for_revision(message.id)
         await chainlit_layer.truncate_revision(message.id)
     view = ChainlitTurnView(
-        detailed_tools=bool(cl.user_session.get("show_tool_details", False))
+        detailed_tools=bool(cl.user_session.get("show_tool_details", False)),
+        tool_title_resolver=lambda name, input_text: agent_service.describe_tool(
+            chat_id, name, input_text
+        ),
     )
     active_views[chat_id] = view
     await view.start()
@@ -216,9 +223,7 @@ async def on_message(message: cl.Message):
 
     after_files = sandbox_files.manifest(chat_id)
     changed_names = [
-        name
-        for name, digest in after_files.items()
-        if before_files.get(name) != digest
+        name for name, digest in after_files.items() if before_files.get(name) != digest
     ]
     await view.complete(
         answer,

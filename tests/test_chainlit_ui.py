@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 from itertools import count
 from pathlib import Path
 
@@ -30,7 +31,7 @@ def test_tool_display_uses_human_labels_and_short_context() -> None:
     )
     read = tool_display("read_file", '{"file_path": "src/agent.py"}')
 
-    assert shell.title == "Python · python -m pytest tests/test_runtime.py -q"
+    assert shell.title == "Выполняю системную команду"
     assert shell.icon == "terminal"
     assert shell.show_input == "bash"
     assert shell.input == "python -m pytest tests/test_runtime.py -q"
@@ -49,12 +50,107 @@ def test_answer_mentions_side_panel_files() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_step_is_collapsed_from_its_first_render(monkeypatch) -> None:
+    initial_state = {}
+
+    class FakeStep:
+        def __init__(self, **kwargs):
+            self.id = kwargs["id"]
+            self.default_open = kwargs.get("default_open", False)
+            self.auto_collapse = kwargs.get("auto_collapse", False)
+            self.start = None
+            self.input = ""
+
+        async def send(self):
+            initial_state["default_open"] = self.default_open
+            initial_state["auto_collapse"] = self.auto_collapse
+
+    monkeypatch.setattr(chainlit_ui.cl, "Step", FakeStep)
+    monkeypatch.setattr(chainlit_ui, "utc_now", lambda: "now")
+    view = ChainlitTurnView()
+    view.root = object()
+
+    await view.handle(ToolStarted("pwd", "execute", '{"command":"pwd"}'))
+
+    assert initial_state == {"default_open": False, "auto_collapse": False}
+
+
+@pytest.mark.asyncio
+async def test_shell_tool_title_is_replaced_by_llm_summary(monkeypatch) -> None:
+    updates = []
+
+    class FakeStep:
+        def __init__(self, **kwargs):
+            self.id = kwargs["id"]
+            self.name = kwargs["name"]
+            self.start = None
+            self.end = None
+            self.input = ""
+            self.output = ""
+
+        async def send(self):
+            assert self.name == "Выполняю системную команду"
+
+        async def update(self):
+            updates.append(self.name)
+
+    async def title_resolver(name: str, input_text: str) -> str | None:
+        assert name == "execute"
+        assert input_text == '{"command":"whoami; uname -a"}'
+        return "Изучаю параметры рабочей системы"
+
+    monkeypatch.setattr(chainlit_ui.cl, "Step", FakeStep)
+    monkeypatch.setattr(chainlit_ui, "utc_now", lambda: "now")
+    view = ChainlitTurnView(tool_title_resolver=title_resolver)
+    view.root = object()
+
+    await view.handle(
+        ToolStarted("inspect", "execute", '{"command":"whoami; uname -a"}')
+    )
+    await view.finish_tool_titles()
+
+    assert updates == ["Изучаю параметры рабочей системы"]
+
+
+@pytest.mark.asyncio
+async def test_non_shell_tool_does_not_request_llm_title(monkeypatch) -> None:
+    requested = False
+
+    class FakeStep:
+        def __init__(self, **kwargs):
+            self.id = kwargs["id"]
+            self.name = kwargs["name"]
+            self.start = None
+            self.input = ""
+
+        async def send(self):
+            return None
+
+    async def title_resolver(_name: str, _input_text: str) -> str | None:
+        nonlocal requested
+        requested = True
+        return "Не должно появиться здесь"
+
+    monkeypatch.setattr(chainlit_ui.cl, "Step", FakeStep)
+    monkeypatch.setattr(chainlit_ui, "utc_now", lambda: "now")
+    view = ChainlitTurnView(tool_title_resolver=title_resolver)
+    view.root = object()
+
+    await view.handle(ToolStarted("read", "read_file", '{"file_path":"README.md"}'))
+    await view.finish_tool_titles()
+
+    assert requested is False
+
+
+@pytest.mark.asyncio
 async def test_turn_view_persists_text_and_tools_in_event_order(monkeypatch) -> None:
     sent = []
     ids = count(1)
 
     class FakeStep:
-        def __init__(self, *, id=None, name="", type="undefined", parent_id=None, **kwargs):
+        def __init__(
+            self, *, id=None, name="", type="undefined", parent_id=None, **kwargs
+        ):
             self.id = id or f"step-{next(ids)}"
             self.name = name
             self.type = type
@@ -157,8 +253,13 @@ async def test_ordered_event_timeline_survives_chainlit_history_reload(
     monkeypatch.setattr(chainlit_data_runtime, "_data_layer_initialized", True)
     init_http_context(thread_id="ordered-chat", user=user)
 
+    async def title_resolver(name: str, _input_text: str) -> str | None:
+        if name == "execute":
+            return "Изучаю содержимое рабочего каталога"
+        return None
+
     async with Step(name="on_message", type="run") as turn:
-        view = ChainlitTurnView()
+        view = ChainlitTurnView(tool_title_resolver=title_resolver)
         await view.start()
         await view.handle(TextDelta("Проверю ожидаемый путь."))
         await view.handle(ToolStarted("bad", "list_files", '{"path":"missing"}'))
@@ -199,9 +300,7 @@ async def test_ordered_event_timeline_survives_chainlit_history_reload(
     page = await reopened.list_threads(
         Pagination(first=10), ThreadFilter(userId=user.id)
     )
-    steps = [
-        step for step in page.data[0]["steps"] if step["type"] != "run"
-    ]
+    steps = [step for step in page.data[0]["steps"] if step["type"] != "run"]
 
     assert [step["metadata"]["event_kind"] for step in steps] == [
         "assistant_text",
@@ -219,4 +318,17 @@ async def test_ordered_event_timeline_survives_chainlit_history_reload(
         "Готово.",
     ]
     assert all(step["parentId"] == turn.id for step in steps)
+    assert next(step["name"] for step in steps if step["id"] == "ls") == (
+        "Изучаю содержимое рабочего каталога"
+    )
     await reopened.close()
+
+    with sqlite3.connect(database) as connection:
+        flags = {
+            row[0]: (bool(row[1]), bool(row[2]))
+            for row in connection.execute(
+                'SELECT id, "defaultOpen", "autoCollapse" FROM steps '
+                'WHERE id IN ("bad", "ls")'
+            )
+        }
+    assert flags == {"bad": (True, False), "ls": (False, False)}
