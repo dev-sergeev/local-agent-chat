@@ -20,21 +20,18 @@ from local_agent_chat.agent_events import (
 from local_agent_chat.chainlit_data import create_chainlit_data_layer
 from local_agent_chat.chainlit_ui import (
     ChainlitTurnView,
-    answer_with_files,
     tool_display,
 )
 
 
 def test_tool_display_uses_human_labels_and_short_context() -> None:
-    shell = tool_display(
-        "execute", '{"command": "python -m pytest tests/test_runtime.py -q"}'
-    )
+    listing = tool_display("ls", '{"path": "/"}')
     read = tool_display("read_file", '{"file_path": "src/agent.py"}')
 
-    assert shell.title == "Выполнение системной команды"
-    assert shell.icon == "terminal"
-    assert shell.show_input == "bash"
-    assert shell.input == "python -m pytest tests/test_runtime.py -q"
+    assert listing.title == "Список файлов · /"
+    assert listing.icon == "list-tree"
+    assert listing.show_input == "json"
+    assert listing.input == '{\n  "path": "/"\n}'
     assert read.title == "Чтение файла · src/agent.py"
     assert read.icon == "file-text"
     assert read.input == '{\n  "file_path": "src/agent.py"\n}'
@@ -68,13 +65,17 @@ def test_tool_display_names_global_memory_actions() -> None:
     assert read.icon == "book-open-text"
 
 
-def test_answer_mentions_side_panel_files() -> None:
-    content = answer_with_files("Готово.", ["report.md", "plot.png"])
+def test_tool_display_names_long_term_memory_actions_without_showing_a_fact() -> None:
+    remember = tool_display(
+        "remember_context", '{"key":"user.name","fact":"[redacted]"}'
+    )
+    forget = tool_display("forget_context", '{"key":"user.name"}')
 
-    assert content.startswith("Готово.")
-    assert "**Изменённые файлы:**" in content
-    assert "`report.md`" in content
-    assert "`plot.png`" in content
+    assert remember.title == "Сохранение в память · user.name"
+    assert remember.icon == "brain"
+    assert "Анна" not in remember.input
+    assert forget.title == "Удаление из памяти · user.name"
+    assert forget.icon == "eraser"
 
 
 @pytest.mark.asyncio
@@ -102,7 +103,7 @@ async def test_complete_renders_answer_without_streamed_text(monkeypatch) -> Non
     view = ChainlitTurnView()
     view.root = FakeRoot()
 
-    await view.complete("non-streamed answer", elements=[], file_names=[])
+    await view.complete("non-streamed answer")
 
     assert [message.content for message in sent] == ["non-streamed answer"]
     assert sent[0].metadata["event_kind"] == "assistant_final"
@@ -129,76 +130,9 @@ async def test_tool_step_is_collapsed_from_its_first_render(monkeypatch) -> None
     view = ChainlitTurnView()
     view.root = object()
 
-    await view.handle(ToolStarted("pwd", "execute", '{"command":"pwd"}'))
+    await view.handle(ToolStarted("root", "ls", '{"path":"/"}'))
 
     assert initial_state == {"default_open": False, "auto_collapse": False}
-
-
-@pytest.mark.asyncio
-async def test_shell_tool_title_is_replaced_by_llm_summary(monkeypatch) -> None:
-    updates = []
-
-    class FakeStep:
-        def __init__(self, **kwargs):
-            self.id = kwargs["id"]
-            self.name = kwargs["name"]
-            self.start = None
-            self.end = None
-            self.input = ""
-            self.output = ""
-
-        async def send(self):
-            assert self.name == "Выполнение системной команды"
-
-        async def update(self):
-            updates.append(self.name)
-
-    async def title_resolver(name: str, input_text: str) -> str | None:
-        assert name == "execute"
-        assert input_text == '{"command":"whoami; uname -a"}'
-        return "Проверка пользователя и версии ядра"
-
-    monkeypatch.setattr(chainlit_ui.cl, "Step", FakeStep)
-    monkeypatch.setattr(chainlit_ui, "utc_now", lambda: "now")
-    view = ChainlitTurnView(tool_title_resolver=title_resolver)
-    view.root = object()
-
-    await view.handle(
-        ToolStarted("inspect", "execute", '{"command":"whoami; uname -a"}')
-    )
-    await view.finish_tool_titles()
-
-    assert updates == ["Проверка пользователя и версии ядра"]
-
-
-@pytest.mark.asyncio
-async def test_non_shell_tool_does_not_request_llm_title(monkeypatch) -> None:
-    requested = False
-
-    class FakeStep:
-        def __init__(self, **kwargs):
-            self.id = kwargs["id"]
-            self.name = kwargs["name"]
-            self.start = None
-            self.input = ""
-
-        async def send(self):
-            return None
-
-    async def title_resolver(_name: str, _input_text: str) -> str | None:
-        nonlocal requested
-        requested = True
-        return "Не должно появиться здесь"
-
-    monkeypatch.setattr(chainlit_ui.cl, "Step", FakeStep)
-    monkeypatch.setattr(chainlit_ui, "utc_now", lambda: "now")
-    view = ChainlitTurnView(tool_title_resolver=title_resolver)
-    view.root = object()
-
-    await view.handle(ToolStarted("read", "read_file", '{"file_path":"README.md"}'))
-    await view.finish_tool_titles()
-
-    assert requested is False
 
 
 @pytest.mark.asyncio
@@ -254,21 +188,21 @@ async def test_turn_view_persists_text_and_tools_in_event_order(monkeypatch) -> 
     view = ChainlitTurnView()
     await view.start()
     await view.handle(TextDelta("Проверю каталог."))
-    await view.handle(ToolStarted("pwd", "execute", '{"command":"pwd"}'))
+    await view.handle(ToolStarted("root", "ls", '{"path":"/"}'))
     await view.handle(
         ToolFinished(
-            "pwd",
+            "root",
             "\x1b[31mtotal 2\x1b[0m\n---\nfile\n```nested```",
         )
     )
     await view.handle(TextDelta("Проверю ожидаемый путь."))
-    await view.handle(ToolStarted("bad", "list_files", '{"path":"missing"}'))
+    await view.handle(ToolStarted("bad", "read_file", '{"file_path":"missing"}'))
     await view.handle(ToolFailed("bad", "path_not_found"))
     await view.handle(TextDelta("Путь не найден, посмотрю корень."))
-    await view.handle(ToolStarted("ls", "execute", '{"command":"ls -la"}'))
-    await view.handle(ToolFinished("ls", f"start\n{'x' * 3000}\nend"))
+    await view.handle(ToolStarted("scan", "glob", '{"pattern":"**/*"}'))
+    await view.handle(ToolFinished("scan", f"start\n{'x' * 3000}\nend"))
     await view.handle(TextDelta("Готово."))
-    await view.complete("Готово.", elements=[], file_names=[])
+    await view.complete("Готово.")
 
     timeline = [
         (item.type, item.id, getattr(item, "content", None))
@@ -277,23 +211,23 @@ async def test_turn_view_persists_text_and_tools_in_event_order(monkeypatch) -> 
     ]
     assert timeline == [
         ("assistant_message", "message-2", "Проверю каталог."),
-        ("tool", "pwd", None),
+        ("tool", "root", None),
         ("assistant_message", "message-3", "Проверю ожидаемый путь."),
         ("tool", "bad", None),
         ("assistant_message", "message-4", "Путь не найден, посмотрю корень."),
-        ("tool", "ls", None),
+        ("tool", "scan", None),
         ("assistant_message", "message-5", "Готово."),
     ]
     assert all(item.parent_id is None for item in sent if item.type == "tool")
-    pwd = next(item for item in sent if item.id == "pwd")
-    assert pwd.input == "pwd"
-    assert pwd.output == "````text\ntotal 2\n---\nfile\n```nested```\n````"
+    root = next(item for item in sent if item.id == "root")
+    assert root.input == '{\n  "path": "/"\n}'
+    assert root.output == "````text\ntotal 2\n---\nfile\n```nested```\n````"
 
     failed = next(item for item in sent if item.id == "bad")
     assert failed.output == "```text\npath_not_found\n```"
     assert failed.is_error is True
 
-    long_log = next(item for item in sent if item.id == "ls").output
+    long_log = next(item for item in sent if item.id == "scan").output
     assert long_log.startswith("```text\nstart\n")
     assert "пропущено" in long_log
     assert long_log.endswith("\nend\n```")
@@ -312,22 +246,17 @@ async def test_ordered_event_timeline_survives_chainlit_history_reload(
     monkeypatch.setattr(chainlit_data_runtime, "_data_layer_initialized", True)
     init_http_context(thread_id="ordered-chat", user=user)
 
-    async def title_resolver(name: str, _input_text: str) -> str | None:
-        if name == "execute":
-            return "Проверка содержимого рабочего каталога"
-        return None
-
     async with Step(name="on_message", type="run") as turn:
-        view = ChainlitTurnView(tool_title_resolver=title_resolver)
+        view = ChainlitTurnView()
         await view.start()
         await view.handle(TextDelta("Проверю ожидаемый путь."))
-        await view.handle(ToolStarted("bad", "list_files", '{"path":"missing"}'))
+        await view.handle(ToolStarted("bad", "read_file", '{"file_path":"missing"}'))
         await view.handle(ToolFailed("bad", "path_not_found"))
         await view.handle(TextDelta("Путь не найден, посмотрю корень."))
-        await view.handle(ToolStarted("ls", "execute", '{"command":"ls -la"}'))
+        await view.handle(ToolStarted("ls", "ls", '{"path":"/"}'))
         await view.handle(ToolFinished("ls", "total 4"))
         await view.handle(TextDelta("Готово."))
-        await view.complete("Готово.", elements=[], file_names=[])
+        await view.complete("Готово.")
 
     for _ in range(100):
         thread = await layer.get_all_user_threads(thread_id="ordered-chat")
@@ -378,7 +307,7 @@ async def test_ordered_event_timeline_survives_chainlit_history_reload(
     ]
     assert all(step["parentId"] == turn.id for step in steps)
     assert next(step["name"] for step in steps if step["id"] == "ls") == (
-        "Проверка содержимого рабочего каталога"
+        "Список файлов · /"
     )
     await reopened.close()
 

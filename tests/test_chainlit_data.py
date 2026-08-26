@@ -220,6 +220,39 @@ async def test_generated_chat_title_replaces_and_outlives_chainlit_raw_name(
 
 
 @pytest.mark.asyncio
+async def test_first_user_request_uses_filenames_when_message_is_empty(
+    tmp_path: Path,
+) -> None:
+    storage = LocalStorageClient(tmp_path / "blobs")
+    layer = create_chainlit_data_layer(tmp_path / "chainlit.sqlite3", storage)
+    user = await layer.create_user(User(identifier="local-user", metadata={}))
+    assert user is not None
+    await layer.update_thread("chat-1", user_id=user.id)
+    await layer.create_step.__wrapped__(
+        layer,
+        {
+            "id": "message-1",
+            "name": "user",
+            "type": "user_message",
+            "threadId": "chat-1",
+            "output": "",
+            "createdAt": "2026-08-21T00:00:00Z",
+        },
+    )
+    await _persist_file_element(
+        layer,
+        thread_id="chat-1",
+        step_id="message-1",
+        element_id="element-1",
+        name="quarterly results.pdf",
+        content=b"report",
+    )
+
+    assert await layer.first_user_request("chat-1") == ("Файлы: quarterly results.pdf")
+    await layer.close()
+
+
+@pytest.mark.asyncio
 async def test_manual_rename_wins_over_pending_chat_title(tmp_path: Path) -> None:
     layer = create_chainlit_data_layer(tmp_path / "chainlit.sqlite3")
     user = await layer.create_user(User(identifier="local-user", metadata={}))

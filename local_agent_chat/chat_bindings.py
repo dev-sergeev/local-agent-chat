@@ -8,6 +8,12 @@ from pathlib import Path
 
 from .agent_modes import AgentMode
 
+_NORMALIZED_AGENT_MODE_SQL = """CASE
+    WHEN agent_mode IN ('read_only', 'extended', 'host_files') THEN 'host_files'
+    WHEN agent_mode = 'chat_files' THEN 'chat_files'
+    ELSE 'chat_files'
+END"""
+
 
 @dataclass(frozen=True, slots=True)
 class ChatBinding:
@@ -52,7 +58,7 @@ class ChatBindings:
                 if legacy_registry:
                     connection.execute(
                         "ALTER TABLE active_branches ADD COLUMN "
-                        "agent_mode TEXT NOT NULL DEFAULT 'read_only'"
+                        "agent_mode TEXT NOT NULL DEFAULT 'host_files'"
                     )
                 if "mode_locked" not in columns:
                     connection.execute(
@@ -60,79 +66,71 @@ class ChatBindings:
                         "mode_locked INTEGER NOT NULL DEFAULT 0"
                     )
                 if legacy_registry:
-                    connection.execute(
-                        "UPDATE active_branches "
-                        "SET agent_mode = 'extended', mode_locked = 1"
-                    )
-                connection.execute(
-                    """UPDATE active_branches SET agent_mode = 'read_only'
-                       WHERE agent_mode IS NULL
-                          OR agent_mode NOT IN ('read_only', 'extended')"""
-                )
+                    connection.execute("UPDATE active_branches SET mode_locked = 1")
 
-            checkpoint_ns_bindings = connection.execute(
+            existing_bindings = connection.execute(
                 """SELECT 1 FROM sqlite_master
                    WHERE type = 'table' AND name = 'chat_bindings'"""
             ).fetchone()
-            if checkpoint_ns_bindings is not None:
+            binding_columns: set[str] = set()
+            if existing_bindings is not None:
                 binding_columns = {
                     row[1]
                     for row in connection.execute("PRAGMA table_info(chat_bindings)")
                 }
-                if "memory_thread_id" not in binding_columns:
-                    connection.execute(
-                        """UPDATE chat_bindings SET agent_mode = 'read_only'
-                           WHERE agent_mode IS NULL
-                              OR agent_mode NOT IN ('read_only', 'extended')"""
-                    )
-                    connection.execute(
-                        "ALTER TABLE chat_bindings "
-                        "RENAME TO checkpoint_ns_chat_bindings"
-                    )
+                connection.execute(
+                    "ALTER TABLE chat_bindings RENAME TO previous_chat_bindings"
+                )
 
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS chat_bindings (
                        chat_id TEXT PRIMARY KEY,
                        profile_id TEXT NOT NULL,
                        memory_thread_id TEXT NOT NULL,
-                       agent_mode TEXT NOT NULL DEFAULT 'read_only'
-                           CHECK(agent_mode IN ('read_only', 'extended')),
+                       agent_mode TEXT NOT NULL DEFAULT 'chat_files'
+                           CHECK(agent_mode IN ('chat_files', 'host_files')),
                        mode_locked INTEGER NOT NULL DEFAULT 0
                            CHECK(mode_locked IN (0, 1))
                    )"""
             )
-            checkpoint_ns_bindings = connection.execute(
-                """SELECT 1 FROM sqlite_master
-                   WHERE type = 'table'
-                     AND name = 'checkpoint_ns_chat_bindings'"""
-            ).fetchone()
-            if checkpoint_ns_bindings is not None:
-                connection.execute(
-                    """INSERT OR IGNORE INTO chat_bindings(
-                           chat_id, profile_id, memory_thread_id,
-                           agent_mode, mode_locked
-                       )
-                       SELECT chat_id, profile_id, chat_id,
-                              agent_mode, mode_locked
-                       FROM checkpoint_ns_chat_bindings"""
+            if existing_bindings is not None:
+                memory_thread_sql = (
+                    "COALESCE(NULLIF(memory_thread_id, ''), chat_id)"
+                    if "memory_thread_id" in binding_columns
+                    else "chat_id"
                 )
-                connection.execute("DROP TABLE checkpoint_ns_chat_bindings")
+                mode_sql = (
+                    _NORMALIZED_AGENT_MODE_SQL
+                    if "agent_mode" in binding_columns
+                    else "'host_files'"
+                )
+                locked_sql = (
+                    "CASE WHEN mode_locked = 1 THEN 1 ELSE 0 END"
+                    if "mode_locked" in binding_columns
+                    else "1"
+                )
+                connection.execute(
+                    f"""INSERT OR IGNORE INTO chat_bindings(
+                            chat_id, profile_id, memory_thread_id,
+                            agent_mode, mode_locked
+                        )
+                        SELECT chat_id, profile_id, {memory_thread_sql},
+                               {mode_sql}, {locked_sql}
+                        FROM previous_chat_bindings"""  # noqa: S608
+                )
+                connection.execute("DROP TABLE previous_chat_bindings")
             if active_branches is not None:
                 connection.execute(
-                    """INSERT OR IGNORE INTO chat_bindings(
+                    f"""INSERT OR IGNORE INTO chat_bindings(
                            chat_id, profile_id, memory_thread_id,
                            agent_mode, mode_locked
                        )
                        SELECT chat_id, profile_id, chat_id,
-                              agent_mode, mode_locked
-                       FROM active_branches"""
+                              {_NORMALIZED_AGENT_MODE_SQL},
+                              CASE WHEN mode_locked = 1 THEN 1 ELSE 0 END
+                       FROM active_branches"""  # noqa: S608
                 )
                 connection.execute("DROP TABLE active_branches")
-            connection.execute(
-                """UPDATE chat_bindings SET agent_mode = 'read_only'
-                   WHERE agent_mode IS NULL
-                      OR agent_mode NOT IN ('read_only', 'extended')"""
-            )
             connection.execute(
                 """UPDATE chat_bindings SET memory_thread_id = chat_id
                    WHERE memory_thread_id IS NULL OR memory_thread_id = ''"""

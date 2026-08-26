@@ -5,7 +5,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from .runtime import Turn
+from .runtime import HistorySnapshot, Turn
 
 DEFAULT_SEARCH_LIMIT = 5
 MAX_SEARCH_LIMIT = 10
@@ -33,6 +33,21 @@ class GlobalMemoryTurn:
     text: str
     answer: str
     selected: bool
+
+
+@dataclass(frozen=True)
+class _StoredTurn:
+    turn: Turn
+    sequence: int
+    created_at: str
+
+
+@dataclass(frozen=True)
+class _HistorySnapshotPayload:
+    chat_id: str
+    start_sequence: int
+    turns: tuple[_StoredTurn, ...]
+    audit_high_watermark: int
 
 
 class SQLiteHistory:
@@ -246,6 +261,86 @@ class SQLiteHistory:
                 (row["chat_id"], row["sequence"]),
             )
             self._insert(connection, turn, row["sequence"])
+
+    async def snapshot_from(self, turn_id: str) -> HistorySnapshot:
+        """Capture one active continuation for compensating a late UI failure."""
+
+        with self._connect() as connection:
+            root = connection.execute(
+                "SELECT chat_id, sequence FROM turns WHERE id = ?", (turn_id,)
+            ).fetchone()
+            if root is None:
+                raise KeyError(turn_id)
+            rows = connection.execute(
+                """SELECT * FROM turns
+                   WHERE chat_id = ? AND sequence >= ?
+                   ORDER BY sequence""",
+                (root["chat_id"], root["sequence"]),
+            ).fetchall()
+            audit_high_watermark = connection.execute(
+                """SELECT COALESCE(MAX(audit_id), 0) FROM superseded_turns
+                   WHERE chat_id = ?""",
+                (root["chat_id"],),
+            ).fetchone()[0]
+        stored = tuple(
+            _StoredTurn(
+                turn=Turn(
+                    id=row["id"],
+                    chat_id=row["chat_id"],
+                    text=row["text"],
+                    answer=row["answer"],
+                    memory_checkpoint=row["memory_checkpoint"],
+                    sandbox_snapshot=row["sandbox_snapshot"],
+                ),
+                sequence=row["sequence"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        )
+        return HistorySnapshot(
+            _HistorySnapshotPayload(
+                chat_id=root["chat_id"],
+                start_sequence=root["sequence"],
+                turns=stored,
+                audit_high_watermark=audit_high_watermark,
+            )
+        )
+
+    async def restore_snapshot(self, snapshot: HistorySnapshot) -> None:
+        """Restore a continuation and discard audit rows from a failed Revision."""
+
+        payload = snapshot.payload
+        if not isinstance(payload, _HistorySnapshotPayload):
+            raise TypeError("History snapshot was created by a different repository")
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM turns WHERE chat_id = ? AND sequence >= ?",
+                (payload.chat_id, payload.start_sequence),
+            )
+            connection.executemany(
+                """INSERT INTO turns
+                   (id, chat_id, sequence, text, answer, memory_checkpoint,
+                    sandbox_snapshot, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        stored.turn.id,
+                        stored.turn.chat_id,
+                        stored.sequence,
+                        stored.turn.text,
+                        stored.turn.answer,
+                        stored.turn.memory_checkpoint,
+                        stored.turn.sandbox_snapshot,
+                        stored.created_at,
+                    )
+                    for stored in payload.turns
+                ],
+            )
+            connection.execute(
+                """DELETE FROM superseded_turns
+                   WHERE chat_id = ? AND audit_id > ?""",
+                (payload.chat_id, payload.audit_high_watermark),
+            )
 
     async def set_answer(self, turn_id: str, answer: str) -> None:
         with self._connect() as connection:

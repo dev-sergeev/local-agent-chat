@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from deepagents.backends import StateBackend
@@ -6,14 +7,15 @@ from langchain_core.language_models.fake_chat_models import (
     FakeListChatModel,
     FakeMessagesListChatModel,
 )
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, SystemMessage
 from langchain_openai import StreamChunkTimeoutError
 
 import local_agent_chat.deep_agent_execution as execution_module
 from local_agent_chat.agent_events import TextDelta, ToolFinished, ToolStarted
-from local_agent_chat.agent_modes import AgentMode
+from local_agent_chat.agent_modes import READ_FILESYSTEM_TOOLS, AgentMode
 from local_agent_chat.chat_bindings import ChatBindings
 from local_agent_chat.deep_agent_execution import DeepAgentExecution
+from local_agent_chat.long_term_memory import MarkdownMemory
 from local_agent_chat.runtime import Turn
 from local_agent_chat.sandbox_files import SandboxFiles
 from local_agent_chat.sandbox_provider import LocalSandboxManager
@@ -41,6 +43,32 @@ class RecoveringSubagentFakeModel(ToolAwareFakeModel):
         return super()._generate(*args, **kwargs)
 
 
+class RecordingToolAwareFakeModel(ToolAwareFakeModel):
+    system_prompts: list[str] = []
+
+    def _generate(self, messages, *args, **kwargs):
+        self.system_prompts.append(
+            "\n".join(
+                str(message.content)
+                for message in messages
+                if isinstance(message, SystemMessage)
+            )
+        )
+        return super()._generate(messages, *args, **kwargs)
+
+
+class RecordingBoundToolsFakeModel(ToolAwareFakeModel):
+    bound_tool_names: ClassVar[list[frozenset[str]]] = []
+
+    def bind_tools(self, tools, **kwargs):
+        self.bound_tool_names.append(
+            frozenset(
+                tool.name if hasattr(tool, "name") else tool["name"] for tool in tools
+            )
+        )
+        return self
+
+
 class StateSandboxManager:
     def __init__(self) -> None:
         self.value = StateBackend()
@@ -50,12 +78,6 @@ class StateSandboxManager:
 
     def files_dir(self, chat_id: str) -> Path:
         return Path("/")
-
-    async def push(self, chat_id: str, backend) -> None:
-        return None
-
-    async def pull(self, chat_id: str, backend) -> None:
-        return None
 
 
 @pytest.mark.asyncio
@@ -158,17 +180,23 @@ async def test_deep_agent_uses_sqlite_checkpoint_and_can_restart_from_empty_revi
 
 
 @pytest.mark.asyncio
-async def test_deep_agent_emits_safe_tool_lifecycle_events(
+async def test_chat_files_agent_reads_an_uploaded_file_with_safe_lifecycle_events(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("hello from upload", encoding="utf-8")
+    files = SandboxFiles(
+        tmp_path / "sandboxes", max_file_bytes=1024, max_chat_bytes=4096
+    )
+    await files.upload("chat-1", source, "hello.txt")
     fake_model = ToolAwareFakeModel(
         responses=[
             AIMessage(
                 content="",
                 tool_calls=[
                     {
-                        "name": "write_file",
-                        "args": {"file_path": "/hello.txt", "content": "hello"},
+                        "name": "read_file",
+                        "args": {"file_path": "/hello.txt"},
                         "id": "call-1",
                         "type": "tool_call",
                     }
@@ -184,28 +212,27 @@ async def test_deep_agent_emits_safe_tool_lifecycle_events(
     database = tmp_path / "checkpoints.sqlite3"
     bindings = ChatBindings(database, (profile.id,))
     bindings.open("chat-1", profile.id)
-    bindings.select_mode("chat-1", AgentMode.EXTENDED)
     bindings.lock("chat-1")
     execution = DeepAgentExecution(
         database,
         (profile,),
-        StateSandboxManager(),
+        LocalSandboxManager(files),
         chat_bindings=bindings,
-    )  # type: ignore[arg-type]
+    )
     events = []
 
     async def record(event) -> None:
         events.append(event)
 
-    answer = await execution.run("chat-1", "write a file", record)
+    answer = await execution.run("chat-1", "read the uploaded file", record)
 
     assert answer == "finished"
     assert isinstance(events[0], ToolStarted)
-    assert events[0].name == "write_file"
+    assert events[0].name == "read_file"
     assert "/hello.txt" in events[0].input
     assert isinstance(events[1], ToolFinished)
     assert events[1].id == events[0].id
-    assert "hello.txt" in events[1].output
+    assert "hello from upload" in events[1].output
     assert not any(isinstance(event, TextDelta) for event in events)
     await execution.close()
 
@@ -288,7 +315,7 @@ async def test_deep_agent_returns_complete_answer_when_streaming_is_disabled(
 
 
 @pytest.mark.asyncio
-async def test_read_only_agent_reads_a_global_absolute_path_without_a_venv(
+async def test_host_files_agent_reads_a_global_absolute_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     external = tmp_path / "outside-chat.txt"
@@ -319,6 +346,7 @@ async def test_read_only_agent_reads_a_global_absolute_path_without_a_venv(
     database = tmp_path / "checkpoints.sqlite3"
     bindings = ChatBindings(database, (profile.id,))
     bindings.open("chat-1", profile.id)
+    bindings.select_mode("chat-1", AgentMode.HOST_FILES)
     bindings.lock("chat-1")
     execution = DeepAgentExecution(
         database,
@@ -338,13 +366,15 @@ async def test_read_only_agent_reads_a_global_absolute_path_without_a_venv(
         isinstance(event, ToolFinished) and "global host content" in event.output
         for event in events
     )
-    assert not (tmp_path / "sandboxes" / "chat-1" / "environment").exists()
     await execution.close()
 
 
 @pytest.mark.asyncio
-async def test_read_only_agent_cannot_dispatch_a_forced_write_tool_call(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("mode", [AgentMode.CHAT_FILES, AgentMode.HOST_FILES])
+async def test_agent_cannot_dispatch_a_forced_removed_mutation_tool_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: AgentMode,
 ) -> None:
     target = tmp_path / "must-not-exist.txt"
     fake_model = ToolAwareFakeModel(
@@ -373,6 +403,7 @@ async def test_read_only_agent_cannot_dispatch_a_forced_write_tool_call(
     database = tmp_path / "checkpoints.sqlite3"
     bindings = ChatBindings(database, (profile.id,))
     bindings.open("chat-1", profile.id)
+    bindings.select_mode("chat-1", mode)
     bindings.lock("chat-1")
     execution = DeepAgentExecution(
         database,
@@ -385,6 +416,67 @@ async def test_read_only_agent_cannot_dispatch_a_forced_write_tool_call(
 
     assert answer == "write unavailable"
     assert target.exists() is False
+    await execution.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [AgentMode.CHAT_FILES, AgentMode.HOST_FILES])
+async def test_both_modes_bind_only_read_only_filesystem_tool_schemas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: AgentMode,
+) -> None:
+    fake_model = RecordingBoundToolsFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "inspect the delegated tool schemas",
+                            "subagent_type": "general-purpose",
+                        },
+                        "id": "capture-subagent-tools",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="subagent schema captured"),
+            AIMessage(content="schema captured"),
+        ]
+    )
+    fake_model.bound_tool_names.clear()
+    monkeypatch.setattr(
+        execution_module, "init_chat_model", lambda *_args, **_kwargs: fake_model
+    )
+    profile = ModelProfile("test", "Test", "openai:test", "TEST_KEY", "key")
+    database = tmp_path / "checkpoints.sqlite3"
+    bindings = ChatBindings(database, (profile.id,))
+    bindings.open("chat-1", profile.id)
+    bindings.select_mode("chat-1", mode)
+    bindings.lock("chat-1")
+    execution = DeepAgentExecution(
+        database,
+        (profile,),
+        StateSandboxManager(),  # type: ignore[arg-type]
+        chat_bindings=bindings,
+    )
+
+    assert await execution.run("chat-1", "report available tools") == (
+        "schema captured"
+    )
+
+    assert fake_model.bound_tool_names
+    forbidden = {"write_file", "edit_file", "delete", "delete_file", "execute"}
+    assert all(
+        not (tool_names & forbidden) for tool_names in fake_model.bound_tool_names
+    )
+    assert any(
+        set(READ_FILESYSTEM_TOOLS) <= tool_names
+        for tool_names in fake_model.bound_tool_names
+    )
+    assert len(fake_model.bound_tool_names) >= 2
     await execution.close()
 
 
@@ -460,4 +552,127 @@ async def test_read_only_agent_can_search_and_read_global_memory(
     tool_outputs = [event.output for event in events if isinstance(event, ToolFinished)]
     assert any('"turn_id":"past-turn"' in output for output in tool_outputs)
     assert any("SQLite FTS5" in output for output in tool_outputs)
+    await execution.close()
+
+
+@pytest.mark.asyncio
+async def test_read_only_agent_remembers_a_name_for_a_new_chat_without_history_search(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_model = RecordingToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "remember_context",
+                        "args": {"key": "user.name", "fact": "Анна"},
+                        "id": "remember-name",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Запомнила."),
+            AIMessage(content="Вас зовут Анна."),
+        ]
+    )
+    monkeypatch.setattr(
+        execution_module, "init_chat_model", lambda *_args, **_kwargs: fake_model
+    )
+    profile = ModelProfile("test", "Test", "openai:test", "TEST_KEY", "key")
+    database = tmp_path / "checkpoints.sqlite3"
+    bindings = ChatBindings(database, (profile.id,))
+    for chat_id in ("chat-1", "chat-2"):
+        bindings.open(chat_id, profile.id)
+        bindings.lock(chat_id)
+    memory_path = tmp_path / "memory" / "MEMORY.md"
+    execution = DeepAgentExecution(
+        database,
+        (profile,),
+        StateSandboxManager(),  # type: ignore[arg-type]
+        long_term_memory=MarkdownMemory(memory_path),
+        chat_bindings=bindings,
+    )
+    events = []
+
+    async def record(event) -> None:
+        events.append(event)
+
+    assert await execution.run("chat-1", "Меня зовут Анна", record) == "Запомнила."
+    assert await execution.run("chat-2", "Как меня зовут?") == "Вас зовут Анна."
+
+    assert "Анна" in memory_path.read_text(encoding="utf-8")
+    assert "Анна" in fake_model.system_prompts[-1]
+    remember_start = next(
+        event
+        for event in events
+        if isinstance(event, ToolStarted) and event.name == "remember_context"
+    )
+    assert "user.name" in remember_start.input
+    assert "Анна" not in remember_start.input
+    assert not any(
+        isinstance(event, ToolStarted) and event.name == "search_past_chats"
+        for event in events
+    )
+    await execution.close()
+
+
+@pytest.mark.asyncio
+async def test_delegated_agent_receives_long_term_memory_as_read_only_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    memory = MarkdownMemory(tmp_path / "memory" / "MEMORY.md")
+    remember = {tool.name: tool for tool in memory.agent_tools()}["remember_context"]
+    assert await remember.ainvoke({"key": "user.name", "fact": "Анна"}) == (
+        "created: user.name"
+    )
+    fake_model = RecordingToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "Подтверди имя пользователя",
+                            "subagent_type": "general-purpose",
+                        },
+                        "id": "delegate-memory",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Имя пользователя — Анна."),
+            AIMessage(content="Подагент подтвердил имя."),
+        ]
+    )
+    fake_model.system_prompts.clear()
+    monkeypatch.setattr(
+        execution_module, "init_chat_model", lambda *_args, **_kwargs: fake_model
+    )
+    profile = ModelProfile("test", "Test", "openai:test", "TEST_KEY", "key")
+    database = tmp_path / "checkpoints.sqlite3"
+    bindings = ChatBindings(database, (profile.id,))
+    bindings.open("chat-1", profile.id)
+    bindings.lock("chat-1")
+    execution = DeepAgentExecution(
+        database,
+        (profile,),
+        StateSandboxManager(),  # type: ignore[arg-type]
+        long_term_memory=memory,
+        chat_bindings=bindings,
+    )
+
+    assert await execution.run("chat-1", "Передай задачу подагенту") == (
+        "Подагент подтвердил имя."
+    )
+
+    delegated_prompts = [
+        prompt
+        for prompt in fake_model.system_prompts
+        if "The calling agent only sees your final assistant message" in prompt
+    ]
+    assert len(delegated_prompts) == 1
+    assert "Анна" in delegated_prompts[0]
+    assert "has no `remember_context` or `forget_context` tool" in delegated_prompts[0]
     await execution.close()

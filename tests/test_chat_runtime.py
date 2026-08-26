@@ -4,7 +4,8 @@ import unittest
 from pathlib import Path
 
 from local_agent_chat.agent_events import EventSink, TextDelta
-from local_agent_chat.runtime import ChatRuntime, Turn
+from local_agent_chat.runtime import ChatRuntime, HistorySnapshot, Turn
+from local_agent_chat.sandbox_files import SandboxFiles
 from local_agent_chat.sqlite_history import SQLiteHistory
 
 
@@ -51,6 +52,15 @@ class InMemoryHistory:
 
     async def get(self, turn_id: str) -> Turn:
         return next(item for item in self.turns if item.id == turn_id)
+
+    async def snapshot_from(self, turn_id: str) -> HistorySnapshot:
+        index = next(i for i, item in enumerate(self.turns) if item.id == turn_id)
+        return HistorySnapshot((turn_id, tuple(self.turns[index:])))
+
+    async def restore_snapshot(self, snapshot: HistorySnapshot) -> None:
+        turn_id, original = snapshot.payload
+        index = next(i for i, item in enumerate(self.turns) if item.id == turn_id)
+        self.turns[index:] = list(original)
 
 
 class ChatRuntimeTest(unittest.IsolatedAsyncioTestCase):
@@ -100,6 +110,100 @@ class ChatRuntimeTest(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_revision_stages_new_upload_after_restoring_original_files(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            files = SandboxFiles(
+                root / "sandboxes",
+                max_file_bytes=1024,
+                max_chat_bytes=4096,
+            )
+            original = root / "original.txt"
+            original.write_text("original", encoding="utf-8")
+            later = root / "later.txt"
+            later.write_text("later", encoding="utf-8")
+            revised = root / "revised.txt"
+            revised.write_text("revised", encoding="utf-8")
+            await files.upload("chat-1", original, original.name)
+
+            agent = RecordingAgent()
+            history = InMemoryHistory(agent.events)
+            runtime = ChatRuntime(agent=agent, sandbox=files, history=history)
+            await runtime.submit("chat-1", "turn-1", "original")
+            await files.upload("chat-1", later, later.name)
+            seen_files: list[str] = []
+
+            async def stage_revised_upload() -> None:
+                await files.upload("chat-1", revised, revised.name)
+
+            async def read_files(
+                chat_id: str, text: str, emit: EventSink | None = None
+            ) -> str:
+                del text, emit
+                seen_files.extend(sorted(files.manifest(chat_id)))
+                return "revised answer"
+
+            agent.run = read_files  # type: ignore[method-assign]
+
+            await runtime.revise(
+                "chat-1",
+                "turn-1",
+                "revised",
+                before_run=stage_revised_upload,
+            )
+
+            self.assertEqual(seen_files, ["original.txt", "revised.txt"])
+
+    async def test_failed_revision_removes_staged_upload_and_restores_active_files(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            files = SandboxFiles(
+                root / "sandboxes",
+                max_file_bytes=1024,
+                max_chat_bytes=4096,
+            )
+            original = root / "original.txt"
+            original.write_text("original", encoding="utf-8")
+            later = root / "later.txt"
+            later.write_text("later", encoding="utf-8")
+            revised = root / "revised.txt"
+            revised.write_text("revised", encoding="utf-8")
+            await files.upload("chat-1", original, original.name)
+
+            agent = RecordingAgent()
+            history = InMemoryHistory(agent.events)
+            runtime = ChatRuntime(agent=agent, sandbox=files, history=history)
+            await runtime.submit("chat-1", "turn-1", "original")
+            await files.upload("chat-1", later, later.name)
+
+            async def stage_revised_upload() -> None:
+                await files.upload("chat-1", revised, revised.name)
+
+            async def fail(
+                chat_id: str, text: str, emit: EventSink | None = None
+            ) -> str:
+                del chat_id, text, emit
+                raise RuntimeError("model failed")
+
+            agent.run = fail  # type: ignore[method-assign]
+
+            with self.assertRaisesRegex(RuntimeError, "model failed"):
+                await runtime.revise(
+                    "chat-1",
+                    "turn-1",
+                    "revised",
+                    before_run=stage_revised_upload,
+                )
+
+            self.assertEqual(
+                sorted(files.manifest("chat-1")),
+                ["later.txt", "original.txt"],
+            )
+
     async def test_failed_revision_keeps_active_history_unchanged(self) -> None:
         agent = RecordingAgent()
         history = InMemoryHistory(agent.events)
@@ -119,6 +223,51 @@ class ChatRuntimeTest(unittest.IsolatedAsyncioTestCase):
             (history.turns[0].text, history.turns[0].answer),
             ("original", "answer:original"),
         )
+
+    async def test_revision_transaction_rolls_back_after_late_ui_failure(self) -> None:
+        agent = RecordingAgent()
+        history = InMemoryHistory(agent.events)
+        runtime = ChatRuntime(
+            agent=agent, sandbox=RecordingSandbox(agent.events), history=history
+        )
+        await runtime.submit("chat-1", "turn-1", "original")
+        await runtime.submit("chat-1", "turn-2", "later")
+
+        with self.assertRaisesRegex(RuntimeError, "UI commit failed"):
+            async with runtime.revision_transaction(
+                "chat-1", "turn-1", "revised"
+            ) as run_revision:
+                self.assertEqual(await run_revision(), "answer:revised")
+                self.assertEqual([turn.text for turn in history.turns], ["revised"])
+                raise RuntimeError("UI commit failed")
+
+        self.assertEqual([turn.text for turn in history.turns], ["original", "later"])
+        self.assertEqual(
+            agent.events[-2:],
+            [
+                ("restore-memory", "memory-before-first"),
+                ("restore-sandbox", "files-before-first"),
+            ],
+        )
+
+    async def test_revision_transaction_rolls_back_after_late_cancellation(
+        self,
+    ) -> None:
+        agent = RecordingAgent()
+        history = InMemoryHistory(agent.events)
+        runtime = ChatRuntime(
+            agent=agent, sandbox=RecordingSandbox(agent.events), history=history
+        )
+        await runtime.submit("chat-1", "turn-1", "original")
+
+        with self.assertRaises(asyncio.CancelledError):
+            async with runtime.revision_transaction(
+                "chat-1", "turn-1", "revised"
+            ) as run_revision:
+                await run_revision()
+                raise asyncio.CancelledError
+
+        self.assertEqual([turn.text for turn in history.turns], ["original"])
 
     async def test_submit_rolls_back_when_history_persistence_fails(self) -> None:
         agent = RecordingAgent()
@@ -253,6 +402,47 @@ class ChatRuntimeTest(unittest.IsolatedAsyncioTestCase):
             )
             with self.assertRaises(KeyError):
                 await reopened.get("turn-2")
+
+    async def test_late_revision_failure_restores_sqlite_history_and_search(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "history.sqlite3"
+            agent = RecordingAgent()
+            history = SQLiteHistory(database)
+            runtime = ChatRuntime(
+                agent=agent,
+                sandbox=RecordingSandbox(agent.events),
+                history=history,
+            )
+            await runtime.submit("chat-1", "turn-1", "original-orchid")
+            await runtime.submit("chat-1", "turn-2", "later-tulip")
+
+            with self.assertRaisesRegex(RuntimeError, "UI commit failed"):
+                async with runtime.revision_transaction(
+                    "chat-1", "turn-1", "revised-lavender"
+                ) as run_revision:
+                    await run_revision()
+                    raise RuntimeError("UI commit failed")
+
+            reopened = SQLiteHistory(database)
+            self.assertEqual((await reopened.get("turn-1")).text, "original-orchid")
+            self.assertEqual((await reopened.get("turn-2")).text, "later-tulip")
+            self.assertFalse(
+                await reopened.search_past_chats(
+                    "revised-lavender", exclude_chat_id="different-chat"
+                )
+            )
+            self.assertEqual(
+                [
+                    hit.turn_id
+                    for hit in await reopened.search_past_chats(
+                        "original-orchid later-tulip",
+                        exclude_chat_id="different-chat",
+                    )
+                ],
+                ["turn-2", "turn-1"],
+            )
 
     async def test_sqlite_history_reports_whether_chat_has_turns(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

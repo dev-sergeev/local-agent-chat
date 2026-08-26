@@ -21,6 +21,7 @@ from .chat_titles import (
     CHAT_TITLE_PENDING,
     CHAT_TITLE_STATE_KEY,
     DEFAULT_CHAT_TITLE,
+    chat_title_source,
 )
 from .tool_logs import format_tool_log
 
@@ -123,13 +124,11 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
         """Claim an unnamed Chat for automatic title generation."""
 
         async with self._thread_lock(thread_id):
-            name, metadata = await self._chat_title_record(thread_id)
+            _name, metadata = await self._chat_title_record(thread_id)
             state = metadata.get(CHAT_TITLE_STATE_KEY)
             if state == CHAT_TITLE_PENDING:
-                return name == DEFAULT_CHAT_TITLE
+                return True
             if state == CHAT_TITLE_FALLBACK:
-                if name != DEFAULT_CHAT_TITLE:
-                    return False
                 await super().update_thread(
                     thread_id,
                     metadata={**metadata, CHAT_TITLE_STATE_KEY: CHAT_TITLE_PENDING},
@@ -151,11 +150,8 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
 
         state = CHAT_TITLE_FALLBACK if fallback else CHAT_TITLE_GENERATED
         async with self._thread_lock(thread_id):
-            name, metadata = await self._chat_title_record(thread_id)
-            if (
-                metadata.get(CHAT_TITLE_STATE_KEY) != CHAT_TITLE_PENDING
-                or name != DEFAULT_CHAT_TITLE
-            ):
+            _name, metadata = await self._chat_title_record(thread_id)
+            if metadata.get(CHAT_TITLE_STATE_KEY) != CHAT_TITLE_PENDING:
                 return False
             await super().update_thread(
                 thread_id,
@@ -166,7 +162,7 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
 
     async def first_user_request(self, thread_id: str) -> str | None:
         rows = await self.execute_sql(
-            query="""SELECT output FROM steps
+            query="""SELECT id, output FROM steps
                 WHERE "threadId" = :thread_id AND type = 'user_message'
                 ORDER BY "createdAt" ASC LIMIT 1""",
             parameters={"thread_id": thread_id},
@@ -174,7 +170,19 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
         if not isinstance(rows, list) or not rows:
             return None
         output = rows[0].get("output")
-        return str(output) if output else None
+        elements = await self.execute_sql(
+            query="""SELECT name FROM elements
+                WHERE "forId" = :step_id AND name IS NOT NULL
+                ORDER BY id LIMIT 5""",
+            parameters={"step_id": rows[0]["id"]},
+        )
+        filenames = (
+            [str(element["name"]) for element in elements if element.get("name")]
+            if isinstance(elements, list)
+            else []
+        )
+        source = chat_title_source(str(output or ""), filenames)
+        return source or None
 
     async def has_user_request(self, thread_id: str) -> bool:
         rows = await self.execute_sql(

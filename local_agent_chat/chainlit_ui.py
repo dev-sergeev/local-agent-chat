@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import asyncio
 import json
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,10 +18,6 @@ class ToolDisplay:
     icon: str
     show_input: str | bool
     input: str
-
-
-_SHELL_TOOLS = {"execute", "shell", "bash"}
-type ToolTitleResolver = Callable[[str, str], Awaitable[str | None]]
 
 
 def _input_dict(value: str) -> dict[str, Any]:
@@ -50,11 +44,6 @@ def _json_input(data: dict[str, Any], fallback: str) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
-def _shell_input(data: dict[str, Any], fallback: str) -> str:
-    command = data.get("command") or data.get("cmd")
-    return str(command) if command else fallback
-
-
 def tool_display(name: str, input_text: str) -> ToolDisplay:
     data = _input_dict(input_text)
     rendered_input = _json_input(data, input_text)
@@ -68,16 +57,6 @@ def tool_display(name: str, input_text: str) -> ToolDisplay:
 
     if name == "read_file":
         return ToolDisplay(f"Чтение файла{suffix}", "file-text", "json", rendered_input)
-    if name == "write_file":
-        return ToolDisplay(
-            f"Создание файла{suffix}", "file-plus-2", "json", rendered_input
-        )
-    if name == "edit_file":
-        return ToolDisplay(
-            f"Изменение файла{suffix}", "file-pen-line", "json", rendered_input
-        )
-    if name == "delete":
-        return ToolDisplay(f"Удаление файла{suffix}", "trash-2", "json", rendered_input)
     if name in {"ls", "list_files"}:
         return ToolDisplay(
             f"Список файлов{suffix}", "list-tree", "json", rendered_input
@@ -90,28 +69,21 @@ def tool_display(name: str, input_text: str) -> ToolDisplay:
         source = _short(data.get("chat_id") or data.get("turn_id"))
         title = "Контекст прошлого диалога" + (f" · {source}" if source else "")
         return ToolDisplay(title, "book-open-text", "json", rendered_input)
+    if name == "remember_context":
+        key = _short(data.get("key"))
+        title = "Сохранение в память" + (f" · {key}" if key else "")
+        return ToolDisplay(title, "brain", "json", rendered_input)
+    if name == "forget_context":
+        key = _short(data.get("key"))
+        title = "Удаление из памяти" + (f" · {key}" if key else "")
+        return ToolDisplay(title, "eraser", "json", rendered_input)
     if name in {"glob", "grep", "search"}:
         return ToolDisplay(f"Поиск по файлам{suffix}", "search", "json", rendered_input)
-    if name in _SHELL_TOOLS:
-        return ToolDisplay(
-            "Выполнение системной команды",
-            "terminal",
-            "bash",
-            _shell_input(data, input_text),
-        )
     if name in {"task", "subagent"}:
         description = _short(data.get("description") or data.get("prompt"))
         title = "Подзадача" + (f" · {description}" if description else "")
         return ToolDisplay(title, "bot", "json", rendered_input)
     return ToolDisplay(f"Инструмент · {name}", "wrench", "json", rendered_input)
-
-
-def answer_with_files(answer: str, names: list[str]) -> str:
-    content = answer.strip() or "Агент завершил работу без текстового ответа."
-    if not names:
-        return content
-    rendered = ", ".join(f"`{name}`" for name in names)
-    return f"{content}\n\n**Изменённые файлы:** {rendered}"
 
 
 class ChainlitTurnView:
@@ -121,10 +93,8 @@ class ChainlitTurnView:
         self,
         *,
         detailed_tools: bool = False,
-        tool_title_resolver: ToolTitleResolver | None = None,
     ) -> None:
         self.detailed_tools = detailed_tools
-        self.tool_title_resolver = tool_title_resolver
         self.parent_id: str | None = None
         self.root: cl.Step | None = None
         self.answer: cl.Message | None = None
@@ -132,32 +102,6 @@ class ChainlitTurnView:
         self.event_sequence = 0
         self.tool_count = 0
         self.terminal = False
-        self._tool_title_tasks: set[asyncio.Task[None]] = set()
-
-    async def _update_tool_title(
-        self, step: cl.Step, name: str, input_text: str
-    ) -> None:
-        if self.tool_title_resolver is None:
-            return
-        try:
-            title = await self.tool_title_resolver(name, input_text)
-            if title:
-                step.name = title
-                await step.update()
-        except Exception:  # noqa: BLE001 - title generation is cosmetic
-            return
-
-    async def finish_tool_titles(self) -> None:
-        pending = list(self._tool_title_tasks)
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-
-    async def _cancel_tool_titles(self) -> None:
-        pending = list(self._tool_title_tasks)
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
 
     def _next_sequence(self) -> int:
         sequence = self.event_sequence
@@ -231,12 +175,6 @@ class ChainlitTurnView:
             await step.send()
             self.tools[event.id] = step
             self.tool_count += 1
-            if event.name in _SHELL_TOOLS and self.tool_title_resolver is not None:
-                task = asyncio.create_task(
-                    self._update_tool_title(step, event.name, event.input)
-                )
-                self._tool_title_tasks.add(task)
-                task.add_done_callback(self._tool_title_tasks.discard)
             return
         step = self.tools.get(event.id)
         if step is None:
@@ -256,15 +194,12 @@ class ChainlitTurnView:
             step.auto_collapse = False
             await step.update()
 
-    async def complete(
-        self, answer: str, *, elements: list[Any], file_names: list[str]
-    ) -> None:
+    async def complete(self, answer: str) -> None:
         if self.root is None:
             raise RuntimeError("Turn view was not started")
         if self.terminal:
             return
         self.terminal = True
-        await self.finish_tool_titles()
         for step in self.tools.values():
             if step.end is None:
                 step.end = utc_now()
@@ -275,7 +210,9 @@ class ChainlitTurnView:
             f"Готово · операций: {self.tool_count}" if self.tool_count else "Готово"
         )
         await self.root.update()
-        rendered_answer = answer_with_files(answer, file_names)
+        rendered_answer = (
+            answer.strip() or "Агент завершил работу без текстового ответа."
+        )
         if self.answer is None:
             self.answer = cl.Message(
                 content=rendered_answer,
@@ -285,12 +222,10 @@ class ChainlitTurnView:
                     "event_sequence": self._next_sequence(),
                 },
             )
-            self.answer.elements = elements
             await self.answer.send()
         else:
             self.answer.content = rendered_answer
             self.answer.metadata["event_kind"] = "assistant_final"
-            self.answer.elements = elements
             await self.answer.update()
 
     async def fail(self, error: str) -> None:
@@ -299,7 +234,6 @@ class ChainlitTurnView:
         if self.terminal:
             return
         self.terminal = True
-        await self.finish_tool_titles()
         for step in self.tools.values():
             if step.end is None:
                 step.end = utc_now()
@@ -343,7 +277,6 @@ class ChainlitTurnView:
         if self.terminal:
             return
         self.terminal = True
-        await self._cancel_tool_titles()
         for step in self.tools.values():
             if step.end is None:
                 step.end = utc_now()

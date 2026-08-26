@@ -48,13 +48,13 @@ def test_mode_selection_message_lock_and_locked_conflict(tmp_path: Path) -> None
         no_persisted_request,
     )
 
-    selected = configurations.select_mode("chat-1", AgentMode.EXTENDED, "local")
+    selected = configurations.select_mode("chat-1", AgentMode.HOST_FILES, "local")
     locked = configurations.accept_message("chat-1", "local")
-    rejected = configurations.select_mode("chat-1", AgentMode.READ_ONLY, "local")
+    rejected = configurations.select_mode("chat-1", AgentMode.CHAT_FILES, "local")
 
-    assert selected.mode is AgentMode.EXTENDED
+    assert selected.mode is AgentMode.HOST_FILES
     assert selected.mode_locked is False
-    assert locked.mode is AgentMode.EXTENDED
+    assert locked.mode is AgentMode.HOST_FILES
     assert locked.mode_locked is True
     assert rejected == locked
     assert configurations.current("chat-1") == locked
@@ -73,12 +73,12 @@ async def test_recovery_locks_only_with_persisted_request_evidence(
 
     bindings = ChatBindings(tmp_path / f"bindings-{has_request}.sqlite3", ("local",))
     configurations = ChatConfigurations(bindings, ("local",), evidence)
-    configurations.select_mode("chat-1", AgentMode.EXTENDED, "local")
+    configurations.select_mode("chat-1", AgentMode.HOST_FILES, "local")
 
     recovered = await configurations.recover("chat-1", "local")
 
     assert calls == ["chat-1"]
-    assert recovered.mode is AgentMode.EXTENDED
+    assert recovered.mode is AgentMode.HOST_FILES
     assert recovered.mode_locked is has_request
     assert configurations.current("chat-1") == recovered
 
@@ -96,7 +96,7 @@ async def test_recovery_evidence_failure_does_not_lock_mode(tmp_path: Path) -> N
 
     current = configurations.current("chat-1")
     assert current is not None
-    assert current.mode is AgentMode.READ_ONLY
+    assert current.mode is AgentMode.CHAT_FILES
     assert current.mode_locked is False
 
 
@@ -130,7 +130,7 @@ async def test_deletion_tombstone_blocks_every_interface_entry(
     for operation in (
         lambda: configurations.current("chat-1"),
         lambda: configurations.open("chat-1", "local"),
-        lambda: configurations.select_mode("chat-1", AgentMode.EXTENDED, "local"),
+        lambda: configurations.select_mode("chat-1", AgentMode.HOST_FILES, "local"),
         lambda: configurations.accept_message("chat-1", "local"),
     ):
         with pytest.raises(RuntimeError, match="being deleted"):

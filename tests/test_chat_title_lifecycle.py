@@ -22,12 +22,13 @@ from local_agent_chat.agent_events import EventSink
 from local_agent_chat.chat_titles import (
     CHAT_TITLE_GENERATED,
     CHAT_TITLE_STATE_KEY,
+    fallback_chat_title,
 )
 from local_agent_chat.runtime import ChatRuntime
 from local_agent_chat.sandbox_files import SandboxFiles
 from local_agent_chat.sqlite_history import SQLiteHistory
 
-EXPECTED_TITLE = "Запуск скрипта и проверка файлов"
+EXPECTED_TITLE = "Анализ загруженных файлов"
 
 
 class TransientTitleModel:
@@ -127,24 +128,24 @@ async def test_transient_chat_title_failure_retries_on_next_turn(
     )
     emitter = RecordingEmitter(session)
     context_var.set(ChainlitContext(session, emitter))
-    first_request = "Создай Python-скрипт, запусти его и проверь список файлов"
+    first_request = "Изучи загруженные файлы и объясни их назначение"
 
     try:
         await chat_app.on_chat_start()
         initial_mode = next(
             item
             for item in emitter.chat_settings_events[-1]
-            if item["id"] == "extended_mode"
+            if item["id"] == "host_files_access"
         )
         assert initial_mode["initial"] is False
         assert initial_mode["disabled"] is False
 
         await chat_app.on_settings_update(
-            {"extended_mode": True, "show_tool_details": False}
+            {"host_files_access": True, "show_tool_details": False}
         )
         binding = chat_app.chat_bindings.get("chat-1")
         assert binding is not None
-        assert binding.mode.value == "extended"
+        assert binding.mode.value == "host_files"
         assert binding.mode_locked is False
 
         await layer.update_thread("chat-1", name=first_request, user_id=user.id)
@@ -152,19 +153,23 @@ async def test_transient_chat_title_failure_retries_on_next_turn(
         await layer.create_step(first.to_dict())
         await chat_app.on_message(first)
         await _wait_for_title_attempt(layer, "fallback")
+        fallback_thread = await layer.get_thread("chat-1")
+        assert fallback_thread is not None
+        assert fallback_thread["name"] == fallback_chat_title(first_request)
+        assert emitter.title_events[-1] == fallback_chat_title(first_request)
         locked_mode = next(
             item
             for item in emitter.chat_settings_events[-1]
-            if item["id"] == "extended_mode"
+            if item["id"] == "host_files_access"
         )
         assert locked_mode["initial"] is True
         assert locked_mode["disabled"] is True
         await chat_app.on_settings_update(
-            {"extended_mode": False, "show_tool_details": False}
+            {"host_files_access": False, "show_tool_details": False}
         )
         binding = chat_app.chat_bindings.get("chat-1")
         assert binding is not None
-        assert binding.mode.value == "extended"
+        assert binding.mode.value == "host_files"
 
         second = cl.Message(id="turn-2", content="Продолжай", type="user_message")
         await layer.create_step(second.to_dict())
@@ -234,7 +239,7 @@ async def test_persisted_first_message_locks_mode_at_next_ui_entrypoint(
     try:
         await chat_app.on_chat_start()
         await chat_app.on_settings_update(
-            {"extended_mode": True, "show_tool_details": False}
+            {"host_files_access": True, "show_tool_details": False}
         )
         await layer.update_thread("chat-resumed", name=request, user_id=user.id)
         assert await layer.complete_chat_title(
@@ -252,7 +257,7 @@ async def test_persisted_first_message_locks_mode_at_next_ui_entrypoint(
             )
         elif recovery_entrypoint == "settings":
             await chat_app.on_settings_update(
-                {"extended_mode": False, "show_tool_details": False}
+                {"host_files_access": False, "show_tool_details": False}
             )
         else:
             await chat_app.on_stop()
@@ -260,17 +265,17 @@ async def test_persisted_first_message_locks_mode_at_next_ui_entrypoint(
         resumed_mode = next(
             item
             for item in emitter.chat_settings_events[-1]
-            if item["id"] == "extended_mode"
+            if item["id"] == "host_files_access"
         )
         assert resumed_mode["initial"] is True
         assert resumed_mode["disabled"] is True
         binding = chat_app.chat_bindings.get("chat-resumed")
         assert binding is not None
-        assert binding.mode.value == "extended"
+        assert binding.mode.value == "host_files"
         assert binding.mode_locked is True
         resumed_thread = await layer.get_thread("chat-resumed")
         assert resumed_thread is not None
-        assert resumed_thread["metadata"]["agent_mode"] == "extended"
+        assert resumed_thread["metadata"]["agent_mode"] == "host_files"
         assert resumed_thread["metadata"]["agent_mode_locked"] is True
         assert resumed_thread["metadata"][CHAT_TITLE_STATE_KEY] == CHAT_TITLE_GENERATED
     finally:
@@ -283,9 +288,9 @@ async def test_persisted_first_message_locks_mode_at_next_ui_entrypoint(
 @pytest.mark.parametrize(
     ("event_order", "expected_mode"),
     [
-        ("message_then_read_only", "extended"),
-        ("read_only_then_message", "read_only"),
-        ("invalid_then_read_only_then_message", "read_only"),
+        ("message_then_chat_files", "host_files"),
+        ("chat_files_then_message", "chat_files"),
+        ("invalid_then_chat_files_then_message", "chat_files"),
     ],
 )
 async def test_socket_acceptance_locks_mode_before_background_message_processing(
@@ -341,9 +346,9 @@ async def test_socket_acceptance_locks_mode_before_background_message_processing
             "engine-socket-race",
             "/",
             None,
-            ["chat_settings_change", {"extended_mode": True}],
+            ["chat_settings_change", {"host_files_access": True}],
         )
-        read_only_event = ["chat_settings_change", {"extended_mode": False}]
+        chat_files_event = ["chat_settings_change", {"host_files_access": False}]
         message_event = [
             "client_message",
             {
@@ -354,10 +359,10 @@ async def test_socket_acceptance_locks_mode_before_background_message_processing
                 }
             },
         ]
-        if event_order == "message_then_read_only":
-            ordered_events = (message_event, read_only_event)
-        elif event_order == "read_only_then_message":
-            ordered_events = (read_only_event, message_event)
+        if event_order == "message_then_chat_files":
+            ordered_events = (message_event, chat_files_event)
+        elif event_order == "chat_files_then_message":
+            ordered_events = (chat_files_event, message_event)
         else:
             invalid_message = [
                 "client_message",
@@ -369,7 +374,7 @@ async def test_socket_acceptance_locks_mode_before_background_message_processing
                     }
                 },
             ]
-            ordered_events = (invalid_message, read_only_event, message_event)
+            ordered_events = (invalid_message, chat_files_event, message_event)
         for event in ordered_events:
             await sio._handle_event("engine-socket-race", "/", None, event)
         await asyncio.sleep(0)

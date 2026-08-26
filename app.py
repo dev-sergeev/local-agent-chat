@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import mimetypes
 from collections.abc import Awaitable
+from contextlib import asynccontextmanager
+from hashlib import sha256
 from pathlib import Path
 
 import chainlit as cl
+from chainlit.config import config as chainlit_config
 from chainlit.input_widget import Switch
 from chainlit.server import app, router
 from fastapi import HTTPException
@@ -28,11 +30,13 @@ from local_agent_chat.chat_configuration import ChatConfigurations
 from local_agent_chat.chat_titles import (
     CHAT_TITLE_FALLBACK,
     CHAT_TITLE_PENDING,
-    DEFAULT_CHAT_TITLE,
+    chat_title_source,
+    fallback_chat_title,
 )
 from local_agent_chat.deep_agent_execution import DeepAgentExecution
 from local_agent_chat.llm_retry import RetryBlock
 from local_agent_chat.local_storage import LocalStorageClient
+from local_agent_chat.long_term_memory import MarkdownMemory
 from local_agent_chat.proxy_prefix import (
     RestoreProxyMethodMiddleware,
     RestoreProxyPrefixMiddleware,
@@ -44,6 +48,21 @@ from local_agent_chat.settings import load_settings
 from local_agent_chat.sqlite_history import SQLiteHistory
 
 settings = load_settings()
+public_dir = Path(__file__).resolve().parent / "public"
+logo_path = public_dir / "localchat-logo.png"
+avatar_path = public_dir / "avatars" / "localchat.png"
+logo_version = sha256(logo_path.read_bytes()).hexdigest()
+avatar_version = sha256(avatar_path.read_bytes()).hexdigest()
+# Chainlit's theme logo endpoint is stable across asset changes. Publish the
+# same file under a content-versioned URL so an ordinary reload invalidates it.
+chainlit_config.ui.logo_file_url = (
+    f"{settings.root_path}/public/{logo_path.name}?v={logo_version}"
+)
+# Publish the avatar through an explicit content-versioned URL as well, so
+# browser caches cannot keep an outdated brand image after an asset update.
+chainlit_config.ui.default_avatar_file_url = (
+    f"{settings.root_path}/public/avatars/{avatar_path.name}?v={avatar_version}"
+)
 app.add_middleware(RestoreProxyPrefixMiddleware, prefix=settings.root_path)
 app.add_middleware(RestoreProxyMethodMiddleware)
 install_empty_file_upload_compatibility()
@@ -59,8 +78,13 @@ sandbox_files = SandboxFiles(
     max_file_bytes=100 * 1024 * 1024,
     max_chat_bytes=1024 * 1024 * 1024,
 )
-sandbox_manager = LocalSandboxManager(sandbox_files)
+project_skills_dir = Path(__file__).resolve().parent / "skills"
+sandbox_manager = LocalSandboxManager(
+    sandbox_files,
+    system_read_roots=(project_skills_dir,),
+)
 runtime_history = SQLiteHistory(settings.data_dir / "runtime-history.sqlite3")
+long_term_memory = MarkdownMemory(settings.data_dir / "memory" / "MEMORY.md")
 checkpoint_database = settings.data_dir / "checkpoints.sqlite3"
 chat_bindings = ChatBindings(
     checkpoint_database,
@@ -73,8 +97,9 @@ agent_execution = DeepAgentExecution(
     settings.models,
     sandbox_manager,
     global_memory=runtime_history,
+    long_term_memory=long_term_memory,
     retry_block=retry_block,
-    skills_dir=Path(__file__).resolve().parent / "skills",
+    skills_dir=project_skills_dir,
     chat_bindings=chat_bindings,
 )
 chat_configurations = ChatConfigurations(
@@ -83,9 +108,9 @@ chat_configurations = ChatConfigurations(
     chainlit_layer.has_user_request,
 )
 install_mode_acceptance_guard(
-    lambda chat_id, profile, extended: chat_configurations.select_mode(
+    lambda chat_id, profile, host_files: chat_configurations.select_mode(
         chat_id,
-        AgentMode.EXTENDED if extended else AgentMode.READ_ONLY,
+        AgentMode.HOST_FILES if host_files else AgentMode.CHAT_FILES,
         profile,
     ),
     chat_configurations.accept_message,
@@ -158,15 +183,24 @@ async def chat_profiles(_user):
     starters = [
         cl.Starter(
             label="Изучить файлы",
-            message="Изучи файлы в песочнице и кратко опиши структуру и назначение проекта.",
+            message=(
+                "Изучи файлы, загруженные в этот диалог, и кратко опиши их "
+                "структуру и назначение."
+            ),
         ),
         cl.Starter(
-            label="Исправить проблему",
-            message="Найди причину проблемы в приложенных файлах, исправь её и проверь результат тестами.",
+            label="Найти причину",
+            message=(
+                "Найди причину проблемы в приложенных файлах и предложи точное "
+                "исправление в ответе."
+            ),
         ),
         cl.Starter(
-            label="Обработать данные",
-            message="Изучи приложенные файлы, обработай данные и сохрани результат в новом файле.",
+            label="Проанализировать данные",
+            message=(
+                "Изучи приложенные файлы, проанализируй данные и сформулируй "
+                "результаты в чате."
+            ),
         ),
         cl.Starter(
             label="Объяснить код",
@@ -196,12 +230,13 @@ async def _publish_chat_title(chat_id: str, request_text: str) -> None:
         await chainlit_layer.wait_for_initial_name(chat_id)
         if not await chainlit_layer.begin_chat_title(chat_id):
             return
+        fallback_title = fallback_chat_title(request_text)
         await cl.context.emitter.emit(
             "first_interaction",
-            {"interaction": DEFAULT_CHAT_TITLE, "thread_id": chat_id},
+            {"interaction": fallback_title, "thread_id": chat_id},
         )
         title = await auxiliary_labels.describe_chat(chat_id, request_text)
-        rendered = title or DEFAULT_CHAT_TITLE
+        rendered = title or fallback_title
         applied = await chainlit_layer.complete_chat_title(
             chat_id, rendered, fallback=title is None
         )
@@ -243,16 +278,18 @@ async def _send_chat_settings(binding: ChatBinding, *, refresh: bool = False) ->
     chat_settings = cl.ChatSettings(
         [
             Switch(
-                id="extended_mode",
-                label="Расширенный режим",
-                initial=binding.mode is AgentMode.EXTENDED,
+                id="host_files_access",
+                label="Чтение файлов с диска",
+                initial=binding.mode is AgentMode.HOST_FILES,
                 tooltip=(
-                    "Добавляет создание, изменение и удаление файлов, а также "
-                    "выполнение команд. Выбор фиксируется после первого сообщения."
+                    "Разрешает чтение файлов с диска. Создание, изменение и "
+                    "удаление файлов, а также выполнение команд недоступны в "
+                    "обоих режимах. Выбор фиксируется после первого сообщения."
                 ),
                 description=(
-                    "Выключено: чтение и поиск по диску. Включено: полный "
-                    "доступ с правами процесса приложения."
+                    "Выключено: только файлы, загруженные в этот диалог. "
+                    "Включено: чтение и поиск по абсолютным путям, доступным "
+                    "процессу приложения."
                 ),
                 disabled=binding.mode_locked,
             ),
@@ -260,7 +297,7 @@ async def _send_chat_settings(binding: ChatBinding, *, refresh: bool = False) ->
                 id="show_tool_details",
                 label="Подробные результаты инструментов",
                 initial=detailed,
-                tooltip="Показывать больше stdout, stderr и результатов файловых операций.",
+                tooltip="Показывать более полные результаты чтения, поиска и памяти.",
             ),
         ]
     )
@@ -305,9 +342,9 @@ async def on_settings_update(updated):
         "show_tool_details", bool(updated.get("show_tool_details", False))
     )
     requested_mode = (
-        AgentMode.EXTENDED
-        if updated.get("extended_mode") is True
-        else AgentMode.READ_ONLY
+        AgentMode.HOST_FILES
+        if updated.get("host_files_access") is True
+        else AgentMode.CHAT_FILES
     )
     chat_id = _thread_id()
     profile_hint = cl.user_session.get("chat_profile")
@@ -326,20 +363,6 @@ async def on_settings_update(updated):
         _remember_chat_configuration(binding)
 
 
-def _changed_file_elements(chat_id: str, names: list[str]):
-    elements = []
-    for name in names:
-        path = str(sandbox_files.files_dir(chat_id) / name)
-        mime, _ = mimetypes.guess_type(name)
-        if mime and mime.startswith("image/"):
-            elements.append(cl.Image(name=name, path=path, display="inline"))
-        elif mime == "application/pdf":
-            elements.append(cl.Pdf(name=name, path=path, display="side"))
-        else:
-            elements.append(cl.File(name=name, path=path, display="side", mime=mime))
-    return elements
-
-
 async def _run_turn(view: ChainlitTurnView, operation: Awaitable[str]) -> str:
     try:
         return await operation
@@ -351,23 +374,6 @@ async def _run_turn(view: ChainlitTurnView, operation: Awaitable[str]) -> str:
         raise _TurnRunFailed from error
 
 
-async def _complete_turn(
-    view: ChainlitTurnView,
-    chat_id: str,
-    before_files: dict[str, str],
-    answer: str,
-) -> None:
-    after_files = await asyncio.to_thread(sandbox_files.manifest, chat_id)
-    changed_names = [
-        name for name, digest in after_files.items() if before_files.get(name) != digest
-    ]
-    await view.complete(
-        answer,
-        elements=_changed_file_elements(chat_id, changed_names),
-        file_names=changed_names,
-    )
-
-
 async def _handle_message(message: cl.Message, chat_id: str) -> None:
     binding = chat_configurations.accept_message(
         chat_id,
@@ -377,6 +383,13 @@ async def _handle_message(message: cl.Message, chat_id: str) -> None:
 
     is_revision = await runtime.has_turn(message.id)
     is_first_turn = not is_revision and not await runtime_history.has_chat(chat_id)
+    uploads: list[tuple[Path, str]] = []
+    for element in message.elements or []:
+        source = getattr(element, "path", None)
+        if source:
+            source_path = Path(source)
+            uploads.append((source_path, element.name or source_path.name))
+
     title_state = await chainlit_layer.chat_title_state(chat_id)
     should_title = False
     if is_first_turn:
@@ -384,44 +397,48 @@ async def _handle_message(message: cl.Message, chat_id: str) -> None:
     elif title_state in {CHAT_TITLE_PENDING, CHAT_TITLE_FALLBACK}:
         should_title = await chainlit_layer.begin_chat_title(chat_id)
     if should_title:
+        current_title_source = chat_title_source(
+            message.content, [name for _source, name in uploads]
+        )
         title_source = (
-            message.content
+            current_title_source
             if is_first_turn
-            else await chainlit_layer.first_user_request(chat_id) or message.content
+            else await chainlit_layer.first_user_request(chat_id)
+            or current_title_source
         )
         _start_chat_title(chat_id, title_source)
 
-    for element in message.elements or []:
-        source = getattr(element, "path", None)
-        if source:
-            await sandbox_files.upload(
-                chat_id, Path(source), element.name or Path(source).name
-            )
+    async def upload_message_files() -> None:
+        for source_path, name in uploads:
+            await sandbox_files.upload(chat_id, source_path, name)
 
-    before_files = await asyncio.to_thread(sandbox_files.manifest, chat_id)
+    if not is_revision:
+        await upload_message_files()
+
     view = ChainlitTurnView(
         detailed_tools=bool(cl.user_session.get("show_tool_details", False)),
-        tool_title_resolver=lambda name, input_text: auxiliary_labels.describe_tool(
-            chat_id, name, input_text
-        ),
     )
     active_views[chat_id] = view
     try:
         if is_revision:
-            async with chainlit_layer.revision(message.id):
-                await view.start()
-                answer = await _run_turn(
-                    view,
-                    runtime.revise(chat_id, message.id, message.content, view.handle),
-                )
-                await _complete_turn(view, chat_id, before_files, answer)
+            async with runtime.revision_transaction(
+                chat_id,
+                message.id,
+                message.content,
+                view.handle,
+                before_run=upload_message_files if uploads else None,
+            ) as run_revision:
+                async with chainlit_layer.revision(message.id):
+                    await view.start()
+                    answer = await _run_turn(view, run_revision())
+                    await view.complete(answer)
         else:
             await view.start()
             answer = await _run_turn(
                 view,
                 runtime.submit(chat_id, message.id, message.content, view.handle),
             )
-            await _complete_turn(view, chat_id, before_files, answer)
+            await view.complete(answer)
     except _TurnRunFailed:
         return
     finally:
@@ -480,7 +497,6 @@ _local_file_route = router.routes.pop()
 router.routes.insert(0, _local_file_route)
 
 
-@app.on_event("shutdown")
 async def close_resources() -> None:
     pending_titles = list(chat_title_tasks.values())
     for task in pending_titles:
@@ -488,3 +504,21 @@ async def close_resources() -> None:
     if pending_titles:
         await asyncio.gather(*pending_titles, return_exceptions=True)
     await agent_execution.close()
+
+
+if getattr(app.state, "_localchat_base_lifespan", None) is None:
+    app.state._localchat_base_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def localchat_lifespan(application):
+        try:
+            async with application.state._localchat_base_lifespan(application) as state:
+                yield state
+        finally:
+            cleanup = getattr(application.state, "_localchat_close_resources", None)
+            if cleanup is not None:
+                await cleanup()
+
+    app.router.lifespan_context = localchat_lifespan
+
+app.state._localchat_close_resources = close_resources

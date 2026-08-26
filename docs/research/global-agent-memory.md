@@ -1,6 +1,6 @@
 # Глобальная память агента между Chat
 
-Дата проверки: **2026-08-25**. Область исследования: локальное single-user приложение Local Agent Chat, его текущая SQLite-архитектура и официальные возможности LangGraph, LangChain и Deep Agents. Использованы только первичные источники: официальная документация, API reference, исходный код проектов и спецификация SQLite.
+Дата проверки: **2026-08-25**. Область исследования: локальное single-user приложение LocalChat, его текущая SQLite-архитектура и официальные возможности LangGraph, LangChain и Deep Agents. Использованы только первичные источники: официальная документация, API reference, исходный код проектов и спецификация SQLite.
 
 Локальная среда на дату проверки: `deepagents==0.7.8`, `langchain==1.3.16`, `langgraph==1.2.11`, `langgraph-checkpoint-sqlite==3.1.1`; Python-модуль `sqlite3` использует SQLite 3.45.1 с `ENABLE_FTS5`. Проект фиксирует совместимые линии зависимостей в [`pyproject.toml`](../../pyproject.toml).
 
@@ -114,7 +114,7 @@ FTS5 входит в SQLite и поддерживает Unicode tokenization, ph
 
 `ORDER BY rank` использует BM25 по умолчанию и может быть быстрее прямого `ORDER BY bm25(...)`; `snippet()` выбирает короткий фрагмент вокруг совпадений. [SQLite FTS5 auxiliary functions и ranking](https://www.sqlite.org/fts5.html#fts5_auxiliary_functions).
 
-Сильные стороны для Local Agent Chat:
+Сильные стороны для LocalChat:
 
 - полностью локальный индекс без embedding API;
 - точный поиск путей, имён файлов, классов, команд, ошибок и цитируемых формулировок;

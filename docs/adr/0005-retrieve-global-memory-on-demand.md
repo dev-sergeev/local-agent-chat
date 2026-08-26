@@ -2,7 +2,7 @@
 
 Global Memory is implemented as two read-only Agent tools: bounded search across other Chats and bounded reading of a selected result with nearby Turns. The tools query an SQLite FTS5 index derived transactionally from canonical active `turns`. They never search the current Chat or `superseded_turns`, and retrieved text is marked as untrusted historical data rather than instructions.
 
-The complete Chat History is not added to every model request. Embeddings, automatic fact extraction, and an always-loaded shared memory file are deferred until retrieval quality is measured; FTS5 is local, deterministic, and effective for paths, identifiers, commands, errors, and quoted prior decisions.
+The complete Chat History is not added to every model request. Embeddings and automatic extraction by a second model call remain deferred; FTS5 is local, deterministic, and effective for paths, identifiers, commands, errors, and quoted prior decisions. ADR 0008 separately introduces a small curated Markdown snapshot that is always loaded, without adding the full history.
 
 ## Consequences
 

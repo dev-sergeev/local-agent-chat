@@ -1,0 +1,12 @@
+:root {
+  --localchat-brand-primary: #E13662;
+}
+
+/* Keep the larger brand mark scoped to the empty-Chat welcome screen. */
+#welcome-screen > img.logo {
+  width: min(420px, calc(100vw - 3rem));
+  height: auto;
+  filter: drop-shadow(
+    0 1rem 2rem color-mix(in srgb, var(--localchat-brand-primary) 18%, transparent)
+  );
+}

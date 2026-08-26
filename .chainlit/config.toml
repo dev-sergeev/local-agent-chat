@@ -96,7 +96,7 @@ reaction_on_message_received = false
 
 [UI]
 # Name of the assistant.
-name = "Local Agent Chat"
+name = "LocalChat"
 
 default_theme = "dark"
 
@@ -119,14 +119,14 @@ layout = "wide"
 confirm_new_chat = true
 
 # Description of the assistant. This is used for HTML tags.
-# description = ""
+description = "Локальное рабочее пространство для продолжительной работы с AI-агентом."
 
 # Chain of Thought (CoT) display mode. Can be "hidden", "tool_call" or "full".
 cot = "tool_call"
 
 # Specify a CSS file that can be used to customize the user interface.
 # The CSS file can be served from the public directory or via an external link.
-# custom_css = "/public/test.css"
+custom_css = "/public/branding.css"
 
 # Specify additional attributes for a custom CSS file
 # custom_css_attributes = "media=\"print\""
@@ -155,9 +155,10 @@ alert_style = "modern"
 # custom_meta_url = "https://github.com/Chainlit/chainlit"
 
 # Specify a custom meta image url.
-# custom_meta_image_url = "https://chainlit-cloud.s3.eu-west-3.amazonaws.com/logo/chainlit_banner.png"
+custom_meta_image_url = "public/localchat-logo.png"
 
-# Load assistant logo directly from URL.
+# app.py replaces this with a root-path-aware, content-versioned public URL so
+# browsers cannot keep showing an older logo after the image changes.
 logo_file_url = ""
 
 # Load assistant avatar image directly from URL.

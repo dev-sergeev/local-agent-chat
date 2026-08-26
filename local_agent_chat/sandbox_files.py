@@ -52,11 +52,6 @@ class SandboxFiles:
     def files_dir(self, chat_id: str) -> Path:
         return self._owned_dir(chat_id, "files")
 
-    def environment_dir(self, chat_id: str) -> Path:
-        """Return runtime state kept outside revisioned Chat files."""
-
-        return self._owned_dir(chat_id, "environment")
-
     def artifacts_dir(self, chat_id: str) -> Path:
         """Return revisioned internal files used to offload model context."""
 

@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import aiosqlite
 from deepagents import create_deep_agent
 from deepagents.middleware.filesystem import FilesystemMiddleware
+from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT, SubAgent
 from langchain.chat_models import init_chat_model
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
@@ -21,13 +22,10 @@ from .agent_events import (
     public_text,
     safe_text,
 )
-from .agent_modes import (
-    EXTENDED_FILESYSTEM_TOOLS,
-    READ_ONLY_FILESYSTEM_TOOLS,
-    AgentMode,
-)
+from .agent_modes import READ_FILESYSTEM_TOOLS
 from .chat_bindings import ChatBinding, ChatBindings
 from .llm_retry import RetryBlock
+from .long_term_memory import REMEMBER_CONTEXT_TOOL, MarkdownMemory
 from .memory_tools import build_global_memory_tools
 from .prompts import agent_system_prompt
 from .sandbox_provider import LocalSandboxManager
@@ -45,6 +43,7 @@ class DeepAgentExecution:
         sandboxes: LocalSandboxManager,
         chat_bindings: ChatBindings,
         global_memory: SQLiteHistory | None = None,
+        long_term_memory: MarkdownMemory | None = None,
         llm_retry: LLMRetryConfig | None = None,
         retry_block: RetryBlock | None = None,
         skills_dir: Path | None = None,
@@ -59,6 +58,7 @@ class DeepAgentExecution:
         self._bindings = chat_bindings
         self._sandboxes = sandboxes
         self._global_memory = global_memory
+        self._long_term_memory = long_term_memory
         self._skill_sources: list[str] | None = None
         if skills_dir is not None:
             resolved_skills = skills_dir.resolve()
@@ -114,29 +114,52 @@ class DeepAgentExecution:
             model_kwargs["disable_streaming"] = True
         model = self._retry_block.create_model(profile, **model_kwargs)
         backend = await self._sandboxes.backend(chat_id, mode)
-        filesystem_tools = (
-            READ_ONLY_FILESYSTEM_TOOLS
-            if mode is AgentMode.READ_ONLY
-            else EXTENDED_FILESYSTEM_TOOLS
+        agent_tools = (
+            build_global_memory_tools(self._global_memory, chat_id)
+            if self._global_memory is not None
+            else []
         )
+
+        def base_middleware() -> list[Any]:
+            return [
+                FilesystemMiddleware(
+                    backend=backend,
+                    tools=list(READ_FILESYSTEM_TOOLS),
+                ),
+                self._retry_block.summarization_middleware(model, backend),
+            ]
+
+        middleware = base_middleware()
+        subagent_middleware = base_middleware()
+        subagent_description = (
+            "General-purpose agent for complex research and multi-step tasks."
+        )
+        if self._long_term_memory is not None:
+            middleware.append(self._long_term_memory.agent_middleware())
+            subagent_middleware.append(self._long_term_memory.reference_middleware())
+            subagent_description += (
+                " It receives Long-term Memory as reference context without its "
+                "mutation tools; report updates to the calling Agent."
+            )
+        general_purpose = cast(
+            SubAgent,
+            {
+                **GENERAL_PURPOSE_SUBAGENT,
+                "description": subagent_description,
+                "middleware": subagent_middleware,
+            },
+        )
+        if self._skill_sources is not None:
+            general_purpose["skills"] = self._skill_sources
         graph = create_deep_agent(
             model=model,
-            tools=(
-                build_global_memory_tools(self._global_memory, chat_id)
-                if self._global_memory is not None
-                else []
-            ),
+            tools=agent_tools,
             backend=backend,
+            subagents=[general_purpose],
             skills=self._skill_sources,
             checkpointer=await self._checkpointer(),
             system_prompt=agent_system_prompt(mode, self._sandboxes.files_dir(chat_id)),
-            middleware=[
-                FilesystemMiddleware(
-                    backend=backend,
-                    tools=list(filesystem_tools),
-                ),
-                self._retry_block.summarization_middleware(model, backend),
-            ],
+            middleware=middleware,
         )
         self._graphs[chat_id] = graph
         return graph
@@ -253,69 +276,82 @@ class DeepAgentExecution:
             binding = self._active_binding(chat_id)
             if not binding.mode_locked:
                 raise RuntimeError("Agent Mode must be locked before execution")
-            mode = binding.mode
             graph = await self._graph(chat_id)
-            backend = await self._sandboxes.backend(chat_id, mode)
-            await self._sandboxes.push(chat_id, backend)
             config = self._base_config(chat_id)
             config["recursion_limit"] = self._recursion_limit
             result: dict[str, Any] | None = None
-            try:
-                initial_input = {"messages": [{"role": "user", "content": text}]}
-                async for event in graph.astream_events(
-                    initial_input,
-                    config=config,
-                    version="v2",
-                    durability="sync",
+            redacted_tool_runs: set[str] = set()
+            initial_input = {"messages": [{"role": "user", "content": text}]}
+            async for event in graph.astream_events(
+                initial_input,
+                config=config,
+                version="v2",
+                durability="sync",
+            ):
+                event_type = event.get("event")
+                data = event.get("data", {})
+                run_id = str(event.get("run_id", ""))
+                if event_type == "on_tool_start":
+                    if emit is not None:
+                        tool_name = str(event.get("name") or "tool")
+                        tool_input = data.get("input")
+                        if tool_name == REMEMBER_CONTEXT_TOOL:
+                            redacted_tool_runs.add(run_id)
+                            key = (
+                                tool_input.get("key")
+                                if isinstance(tool_input, dict)
+                                else None
+                            )
+                            tool_input = {"key": key, "fact": "[redacted]"}
+                        await emit(
+                            ToolStarted(
+                                id=run_id,
+                                name=tool_name,
+                                input=safe_text(tool_input, max_chars=4000),
+                            )
+                        )
+                elif event_type == "on_tool_end":
+                    if emit is not None:
+                        output = data.get("output")
+                        await emit(
+                            ToolFinished(
+                                id=run_id,
+                                output=safe_text(
+                                    getattr(output, "content", output),
+                                    max_chars=6000,
+                                ),
+                            )
+                        )
+                    redacted_tool_runs.discard(run_id)
+                elif event_type == "on_tool_error":
+                    if emit is not None:
+                        error = (
+                            "Long-term Memory tool failed"
+                            if run_id in redacted_tool_runs
+                            or event.get("name") == REMEMBER_CONTEXT_TOOL
+                            else safe_text(data.get("error"), max_chars=4000)
+                        )
+                        await emit(
+                            ToolFailed(
+                                id=run_id,
+                                error=error,
+                            )
+                        )
+                    redacted_tool_runs.discard(run_id)
+                elif event_type == "on_chat_model_stream" and emit is not None:
+                    chunk = data.get("chunk")
+                    if getattr(chunk, "tool_call_chunks", None):
+                        continue
+                    delta = public_text(getattr(chunk, "content", None))
+                    if delta:
+                        await emit(TextDelta(delta))
+                elif (
+                    event_type == "on_chain_end"
+                    and not event.get("parent_ids")
+                    and isinstance(data.get("output"), dict)
+                    and "messages" in data["output"]
                 ):
-                    event_type = event.get("event")
-                    data = event.get("data", {})
-                    run_id = str(event.get("run_id", ""))
-                    if event_type == "on_tool_start":
-                        if emit is not None:
-                            await emit(
-                                ToolStarted(
-                                    id=run_id,
-                                    name=str(event.get("name") or "tool"),
-                                    input=safe_text(data.get("input"), max_chars=4000),
-                                )
-                            )
-                    elif event_type == "on_tool_end":
-                        if emit is not None:
-                            output = data.get("output")
-                            await emit(
-                                ToolFinished(
-                                    id=run_id,
-                                    output=safe_text(
-                                        getattr(output, "content", output),
-                                        max_chars=6000,
-                                    ),
-                                )
-                            )
-                    elif event_type == "on_tool_error":
-                        if emit is not None:
-                            await emit(
-                                ToolFailed(
-                                    id=run_id,
-                                    error=safe_text(data.get("error"), max_chars=4000),
-                                )
-                            )
-                    elif event_type == "on_chat_model_stream" and emit is not None:
-                        chunk = data.get("chunk")
-                        if getattr(chunk, "tool_call_chunks", None):
-                            continue
-                        delta = public_text(getattr(chunk, "content", None))
-                        if delta:
-                            await emit(TextDelta(delta))
-                    elif (
-                        event_type == "on_chain_end"
-                        and not event.get("parent_ids")
-                        and isinstance(data.get("output"), dict)
-                        and "messages" in data["output"]
-                    ):
-                        result = data["output"]
-            finally:
-                await self._sandboxes.pull(chat_id, backend)
+                    result = data["output"]
             if result is None:
                 raise RuntimeError("Agent finished without a final state")
             message = result["messages"][-1]

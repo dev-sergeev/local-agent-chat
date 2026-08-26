@@ -58,12 +58,12 @@ def install_mode_acceptance_guard(
                 if (
                     event == "chat_settings_change"
                     and isinstance(payload, dict)
-                    and "extended_mode" in payload
+                    and "host_files_access" in payload
                 ):
                     select_mode(
                         session.thread_id,
                         session.chat_profile,
-                        payload["extended_mode"] is True,
+                        payload["host_files_access"] is True,
                     )
                 elif event == "client_message" and _valid_user_message(payload):
                     lock_chat(session.thread_id, session.chat_profile)

@@ -46,24 +46,22 @@ def labels_with(
 
 
 @pytest.mark.asyncio
-async def test_tool_label_uses_profile_retry_policy_and_cached_model(
+async def test_chat_label_uses_profile_retry_policy_and_cached_model(
     tmp_path: Path,
 ) -> None:
     labels, init_calls, calls = labels_with(
         tmp_path,
         [
-            "Проверка пользователя и версии ядра",
             "Аудит проекта перед публикацией",
+            "Разбор ошибки загрузки файла",
         ],
     )
 
-    tool = await labels.describe_tool(
-        "chat-1", "execute", '{"command":"whoami; uname -a"}'
-    )
     chat = await labels.describe_chat("chat-1", "Проведи полный аудит проекта")
+    second_chat = await labels.describe_chat("chat-1", "Исправь ошибку загрузки файла")
 
-    assert tool == "Проверка пользователя и версии ядра"
     assert chat == "Аудит проекта перед публикацией"
+    assert second_chat == "Разбор ошибки загрузки файла"
     assert init_calls == [
         (
             "openai:test",
@@ -77,43 +75,18 @@ async def test_tool_label_uses_profile_retry_policy_and_cached_model(
             },
         )
     ]
-    assert "whoami; uname -a" in calls[0][1][1]
-    assert "<user-request>" in calls[1][1][1]
+    assert "<user-request>" in calls[0][1][1]
+    assert "Проведи полный аудит проекта" in calls[0][1][1]
+    assert "Исправь ошибку загрузки файла" in calls[1][1][1]
 
 
 @pytest.mark.asyncio
-async def test_tool_label_reprompts_one_rejected_answer(tmp_path: Path) -> None:
-    labels, _init_calls, calls = labels_with(
-        tmp_path,
-        [
-            "Изучаю параметры текущей системы",
-            "Проверка пользователя и версии ядра",
-        ],
+async def test_chat_label_provider_failure_is_cosmetic(tmp_path: Path) -> None:
+    labels, _init_calls, _calls = labels_with(
+        tmp_path, [RuntimeError("provider unavailable")]
     )
 
-    title = await labels.describe_tool("chat-1", "execute", "whoami")
-
-    assert title == "Проверка пользователя и версии ядра"
-    assert len(calls) == 2
-    retry_context = "\n".join(str(message[1]) for message in calls[1])
-    assert "Изучаю параметры текущей системы" in retry_context
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "responses",
-    [
-        [RuntimeError("provider unavailable")],
-        ["Изучаю систему", RuntimeError("provider unavailable")],
-        ["Изучаю систему", "Изучаю параметры системы"],
-    ],
-)
-async def test_tool_label_failures_are_cosmetic(
-    tmp_path: Path, responses: list[str | BaseException]
-) -> None:
-    labels, _init_calls, _calls = labels_with(tmp_path, responses)
-
-    assert await labels.describe_tool("chat-1", "execute", "pwd") is None
+    assert await labels.describe_chat("chat-1", "Сделай что-нибудь") is None
 
 
 @pytest.mark.asyncio
@@ -156,7 +129,7 @@ async def test_missing_or_stale_binding_does_not_call_provider(tmp_path: Path) -
     )
 
     assert await labels.describe_chat("missing-chat", "request") is None
-    assert await labels.describe_tool("stale-chat", "execute", "pwd") is None
+    assert await labels.describe_chat("stale-chat", "request") is None
     assert factory_calls == 0
 
 

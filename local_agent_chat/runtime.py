@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -16,6 +17,13 @@ class Turn:
     answer: str
     memory_checkpoint: str
     sandbox_snapshot: str
+
+
+@dataclass(frozen=True)
+class HistorySnapshot:
+    """Opaque active-history continuation retained until Revision commits."""
+
+    payload: object
 
 
 class Agent(Protocol):
@@ -35,6 +43,8 @@ class History(Protocol):
     async def append(self, turn: Turn) -> None: ...
     async def replace_from(self, turn_id: str, turn: Turn) -> None: ...
     async def get(self, turn_id: str) -> Turn: ...
+    async def snapshot_from(self, turn_id: str) -> HistorySnapshot: ...
+    async def restore_snapshot(self, snapshot: HistorySnapshot) -> None: ...
 
 
 class ChatRuntime:
@@ -65,6 +75,29 @@ class ChatRuntime:
                 raise errors[0]
             if errors:
                 raise BaseExceptionGroup("Failed to restore Chat state", errors)
+
+        await asyncio.shield(restore())
+
+    async def _restore_revision_state(
+        self,
+        chat_id: str,
+        memory: str,
+        files: str,
+        history: HistorySnapshot | None,
+    ) -> None:
+        async def restore() -> None:
+            operations = [
+                self._agent.restore(chat_id, memory),
+                self._sandbox.restore(chat_id, files),
+            ]
+            if history is not None:
+                operations.append(self._history.restore_snapshot(history))
+            results = await asyncio.gather(*operations, return_exceptions=True)
+            errors = [result for result in results if isinstance(result, BaseException)]
+            if len(errors) == 1:
+                raise errors[0]
+            if errors:
+                raise BaseExceptionGroup("Failed to restore Revision state", errors)
 
         await asyncio.shield(restore())
 
@@ -103,7 +136,30 @@ class ChatRuntime:
         turn_id: str,
         text: str,
         emit: EventSink | None = None,
+        *,
+        before_run: Callable[[], Awaitable[None]] | None = None,
     ) -> str:
+        async with self.revision_transaction(
+            chat_id,
+            turn_id,
+            text,
+            emit,
+            before_run=before_run,
+        ) as run:
+            return await run()
+
+    @asynccontextmanager
+    async def revision_transaction(
+        self,
+        chat_id: str,
+        turn_id: str,
+        text: str,
+        emit: EventSink | None = None,
+        *,
+        before_run: Callable[[], Awaitable[None]] | None = None,
+    ) -> AsyncIterator[Callable[[], Awaitable[str]]]:
+        """Keep runtime rollback data alive through the caller's UI commit."""
+
         async with self._enter_chat(chat_id):
             if chat_id in self._deleting:
                 raise RuntimeError("Chat is being deleted")
@@ -113,9 +169,19 @@ class ChatRuntime:
 
             rollback_memory = await self._agent.checkpoint(chat_id)
             rollback_files = await self._sandbox.snapshot(chat_id)
-            try:
+            rollback_history = await self._history.snapshot_from(turn_id)
+            run_started = False
+            history_replaced = False
+
+            async def run() -> str:
+                nonlocal run_started, history_replaced
+                if run_started:
+                    raise RuntimeError("Revision operation can only run once")
+                run_started = True
                 await self._agent.restore(chat_id, original.memory_checkpoint)
                 await self._sandbox.restore(chat_id, original.sandbox_snapshot)
+                if before_run is not None:
+                    await before_run()
                 answer = await self._agent.run(chat_id, text, emit)
                 replacement = Turn(
                     turn_id,
@@ -126,10 +192,21 @@ class ChatRuntime:
                     original.sandbox_snapshot,
                 )
                 await self._history.replace_from(turn_id, replacement)
+                history_replaced = True
+                return answer
+
+            try:
+                yield run
+                if run_started and not history_replaced:
+                    raise RuntimeError("Revision operation did not complete")
             except (Exception, asyncio.CancelledError):
-                await self._restore_state(chat_id, rollback_memory, rollback_files)
+                await self._restore_revision_state(
+                    chat_id,
+                    rollback_memory,
+                    rollback_files,
+                    rollback_history if history_replaced else None,
+                )
                 raise
-            return answer
 
     async def delete_chat(
         self, chat_id: str, cleanup: Callable[[], Awaitable[None]]

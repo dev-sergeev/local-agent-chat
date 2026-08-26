@@ -109,21 +109,16 @@ class SandboxFilesTest(unittest.IsolatedAsyncioTestCase):
             )
 
             stored = await files.upload("chat-1", source, "../report.txt")
-            environment = files.environment_dir("chat-1")
-            environment.joinpath("installed-package").write_text("keep")
             artifact = files.artifacts_dir("chat-1") / "conversation_history" / "1"
             artifact.parent.mkdir()
             artifact.write_text("original context", encoding="utf-8")
             snapshot = await files.snapshot("chat-1")
-            stored.write_text("changed by agent", encoding="utf-8")
+            stored.write_text("changed after snapshot", encoding="utf-8")
             artifact.write_text("changed context", encoding="utf-8")
             await files.restore("chat-1", snapshot)
 
             self.assertEqual(stored.read_text(encoding="utf-8"), "original")
             self.assertEqual(stored.parent, root / "sandboxes" / "chat-1" / "files")
-            self.assertEqual(
-                environment.joinpath("installed-package").read_text(), "keep"
-            )
             self.assertEqual(artifact.read_text(), "original context")
             self.assertEqual(set(files.manifest("chat-1")), {"report.txt"})
 
@@ -222,14 +217,14 @@ class SandboxFilesTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(stored.read_bytes(), b"12345")
             self.assertEqual(set(files.manifest("chat-1")), {"report.txt"})
 
-    async def test_deleting_chat_removes_files_snapshots_and_environment(self) -> None:
+    async def test_deleting_chat_removes_files_snapshots_and_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             files = SandboxFiles(
                 root / "sandboxes", max_file_bytes=100, max_chat_bytes=200
             )
             files.files_dir("chat-1").joinpath("file.txt").write_text("content")
-            files.environment_dir("chat-1").joinpath("marker").write_text("runtime")
+            files.artifacts_dir("chat-1").joinpath("marker").write_text("context")
             await files.snapshot("chat-1")
             await files.delete_chat("chat-1")
             self.assertFalse((root / "sandboxes" / "chat-1").exists())

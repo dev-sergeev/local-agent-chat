@@ -4,6 +4,7 @@ import sqlite3
 import subprocess
 import time
 import uuid
+from hashlib import sha256
 from pathlib import Path
 
 import requests
@@ -62,6 +63,7 @@ def test_chainlit_server_works_behind_root_path(tmp_path: Path) -> None:
             raise AssertionError("server did not start within 12 seconds")
         assert prefix in response.text
         assert f"{prefix}/public/proxy-method-override.js" in response.text
+        assert f"{prefix}/public/branding.css" in response.text
         proxy_script = session.get(f"{root}/public/proxy-method-override.js", timeout=2)
         assert proxy_script.status_code == 200
         assert 'headers.set("X-Proxy-Method-Override", "DELETE")' in (proxy_script.text)
@@ -152,6 +154,43 @@ def test_chainlit_server_works_behind_root_path(tmp_path: Path) -> None:
         assert settings["ui"]["cot"] == "tool_call"
         assert settings["ui"]["language"] == "ru-RU"
         assert settings["ui"]["layout"] == "wide"
+        assert settings["ui"]["name"] == "LocalChat"
+        assert settings["ui"]["custom_css"] == "/public/branding.css"
+        branding = session.get(f"{root}/public/branding.css", timeout=2)
+        assert branding.status_code == 200
+        assert "--localchat-brand-primary: #E13662" in branding.text
+        assert "var(--localchat-brand-primary)" in branding.text
+        assert "width: min(420px, calc(100vw - 3rem))" in branding.text
+        wordmark_bytes = Path("public/localchat-logo.png").read_bytes()
+        avatar_bytes = Path("public/avatars/localchat.png").read_bytes()
+        favicon_bytes = Path("public/favicon.png").read_bytes()
+        logo_version = sha256(wordmark_bytes).hexdigest()
+        avatar_version = sha256(avatar_bytes).hexdigest()
+        versioned_logo_url = f"{prefix}/public/localchat-logo.png?v={logo_version}"
+        versioned_avatar_url = (
+            f"{prefix}/public/avatars/localchat.png?v={avatar_version}"
+        )
+        assert settings["ui"]["logo_file_url"] == versioned_logo_url
+        assert settings["ui"]["default_avatar_file_url"] == versioned_avatar_url
+        versioned_logo = session.get(
+            f"http://127.0.0.1:{port}{versioned_logo_url}", timeout=2
+        )
+        assert versioned_logo.status_code == 200
+        assert versioned_logo.content == wordmark_bytes
+        logo = session.get(f"{root}/logo?theme=dark", timeout=2)
+        assert logo.status_code == 200
+        assert logo.content == wordmark_bytes
+        light_logo = session.get(f"{root}/logo?theme=light", timeout=2)
+        assert light_logo.status_code == 200
+        assert light_logo.content == wordmark_bytes
+        avatar = session.get(
+            f"http://127.0.0.1:{port}{versioned_avatar_url}", timeout=2
+        )
+        assert avatar.status_code == 200
+        assert avatar.content == avatar_bytes
+        favicon = session.get(f"{root}/favicon", timeout=2)
+        assert favicon.status_code == 200
+        assert favicon.content == favicon_bytes
         assert [item["name"] for item in settings["chatProfiles"]] == [
             "openrouter-deepseek"
         ]

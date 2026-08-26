@@ -4,22 +4,13 @@ from enum import StrEnum
 
 
 class AgentMode(StrEnum):
-    """A Chat's immutable filesystem and command capability set."""
+    """A Chat's immutable file-reading scope."""
 
-    READ_ONLY = "read_only"
-    EXTENDED = "extended"
+    CHAT_FILES = "chat_files"
+    HOST_FILES = "host_files"
 
 
-# Keep these allowlists explicit: a Deep Agents upgrade must not silently add a
-# newly introduced filesystem capability to either mode.
-READ_ONLY_FILESYSTEM_TOOLS = ("ls", "read_file", "glob", "grep")
-EXTENDED_FILESYSTEM_TOOLS = (
-    "ls",
-    "read_file",
-    "write_file",
-    "edit_file",
-    "delete",
-    "glob",
-    "grep",
-    "execute",
-)
+# Both modes expose exactly the same read tools. The mode changes only the
+# backend scope; keeping one allowlist prevents a dependency upgrade from
+# silently restoring file mutation or command execution.
+READ_FILESYSTEM_TOOLS = ("ls", "read_file", "glob", "grep")

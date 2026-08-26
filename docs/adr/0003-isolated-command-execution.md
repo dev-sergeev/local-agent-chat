@@ -1,5 +1,9 @@
 # Execute Extended-mode commands in a Chat-specific Python environment
 
+> Status: superseded by [ADR 0009](0009-scope-agent-file-reading-by-chat-mode.md).
+> Agent command/code execution and per-Chat Python environments were removed.
+> The text below records the former decision only.
+
 Only Extended Agent Mode exposes command execution. Python and shell commands execute through a local Deep Agents backend whose working directory is the Chat's `files/` directory, while absolute paths retain their real host meaning. Every Extended Chat owns a persistent `environment/venv` plus private `HOME`, temp and cache directories. The service environment is removed from `PATH`, user site-packages are disabled and normal `pip` operations target only the Chat venv. Read-only Chat creates no environment.
 
 ## Consequences

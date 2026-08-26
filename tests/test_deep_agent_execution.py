@@ -12,13 +12,10 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 from local_agent_chat import deep_agent_execution as agent_execution_module
-from local_agent_chat.agent_modes import (
-    EXTENDED_FILESYSTEM_TOOLS,
-    READ_ONLY_FILESYSTEM_TOOLS,
-    AgentMode,
-)
+from local_agent_chat.agent_modes import READ_FILESYSTEM_TOOLS, AgentMode
 from local_agent_chat.chat_bindings import ChatBindings
 from local_agent_chat.deep_agent_execution import DeepAgentExecution
+from local_agent_chat.long_term_memory import MarkdownMemory
 from local_agent_chat.settings import LLMRetryConfig, ModelProfile
 from local_agent_chat.sqlite_history import SQLiteHistory
 
@@ -36,8 +33,8 @@ def profile() -> ModelProfile:
 @pytest.mark.parametrize(
     ("mode", "expected_filesystem_tools"),
     [
-        (AgentMode.READ_ONLY, READ_ONLY_FILESYSTEM_TOOLS),
-        (AgentMode.EXTENDED, EXTENDED_FILESYSTEM_TOOLS),
+        (AgentMode.CHAT_FILES, READ_FILESYSTEM_TOOLS),
+        (AgentMode.HOST_FILES, READ_FILESYSTEM_TOOLS),
     ],
 )
 async def test_graph_uses_locked_mode_capabilities_and_global_memory_tools(
@@ -86,6 +83,7 @@ async def test_graph_uses_locked_mode_capabilities_and_global_memory_tools(
         (profile(),),
         sandboxes,  # type: ignore[arg-type]
         global_memory=SQLiteHistory(tmp_path / "history.sqlite3"),
+        long_term_memory=MarkdownMemory(tmp_path / "memory" / "MEMORY.md"),
         skills_dir=tmp_path / "skills",
         chat_bindings=bindings,
     )
@@ -104,14 +102,47 @@ async def test_graph_uses_locked_mode_capabilities_and_global_memory_tools(
     summarization_middleware = captured["middleware"][1]  # type: ignore[index]
     assert summarization_middleware.name == "SummarizationMiddleware"
     assert summarization_middleware._lc_helper._summary_model is captured["model"]
+    memory_middleware = captured["middleware"][2]  # type: ignore[index]
+    assert memory_middleware.name == "_RefreshingMemoryMiddleware"
+    assert "remember_context" in memory_middleware.system_prompt
+    assert {tool.name for tool in memory_middleware.tools} == {
+        "remember_context",
+        "forget_context",
+    }
     assert {tool.name for tool in captured["tools"]} == {  # type: ignore[union-attr]
         "search_past_chats",
         "read_past_chat",
     }
+    subagent = captured["subagents"][0]  # type: ignore[index]
+    assert subagent["name"] == "general-purpose"
+    assert "without its mutation tools" in subagent["description"]
+    subagent_filesystem = subagent["middleware"][0]
+    assert tuple(tool.name for tool in subagent_filesystem.tools) == (
+        READ_FILESYSTEM_TOOLS
+    )
+    subagent_memory = subagent["middleware"][2]
+    assert subagent_memory.name == "_RefreshingMemoryMiddleware"
+    assert subagent_memory.tools == ()
+    assert "has no `remember_context` or `forget_context` tool" in (
+        subagent_memory.system_prompt
+    )
+    assert subagent["skills"] == [(tmp_path / "skills").resolve().as_posix()]
     assert sandboxes.modes == [mode]
-    expected_label = "Read-only" if mode is AgentMode.READ_ONLY else "Extended"
+    expected_label = (
+        "Chat Files Agent Mode"
+        if mode is AgentMode.CHAT_FILES
+        else "Host Files Agent Mode"
+    )
     assert expected_label in captured["system_prompt"]  # type: ignore[operator]
-    assert str(sandboxes.files_dir("chat-1")) in captured["system_prompt"]  # type: ignore[operator]
+    prompt = captured["system_prompt"]
+    assert "helpful assistant operating inside the LocalChat chat harness" in prompt
+    assert "concise, neutral and matter-of-fact language" in prompt
+    assert "Do not add filler" in prompt
+    assert all(term in prompt for term in ("emojis", "emoticons", "decorative symbols"))
+    if mode is AgentMode.HOST_FILES:
+        assert str(sandboxes.files_dir("chat-1")) in prompt  # type: ignore[operator]
+    else:
+        assert str(sandboxes.files_dir("chat-1")) not in prompt  # type: ignore[operator]
     assert captured["skills"] == [(tmp_path / "skills").resolve().as_posix()]
 
 
@@ -135,6 +166,7 @@ async def test_main_model_uses_configured_llm_retry_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     init_calls: list[tuple[str, dict[str, object]]] = []
+    captured: dict[str, object] = {}
 
     class FakeModel(FakeListChatModel):
         def bind_tools(self, _tools, **_kwargs):
@@ -155,8 +187,13 @@ async def test_main_model_uses_configured_llm_retry_policy(
         return FakeModel(responses=["Надёжная генерация названия диалога"])
 
     monkeypatch.setattr(agent_execution_module, "init_chat_model", fake_init)
+
+    def fake_create_deep_agent(**kwargs):
+        captured.update(kwargs)
+        return object()
+
     monkeypatch.setattr(
-        agent_execution_module, "create_deep_agent", lambda **_kwargs: object()
+        agent_execution_module, "create_deep_agent", fake_create_deep_agent
     )
     configured_profile = ModelProfile(
         "local",
@@ -198,6 +235,10 @@ async def test_main_model_uses_configured_llm_retry_policy(
         "timeout": 17.0,
     }
     assert init_calls == [("openai:test", shared_policy)]
+    subagent = captured["subagents"][0]  # type: ignore[index]
+    assert tuple(tool.name for tool in subagent["middleware"][0].tools) == (
+        READ_FILESYSTEM_TOOLS
+    )
 
 
 @pytest.mark.asyncio
@@ -286,12 +327,6 @@ async def test_restoring_an_empty_checkpoint_starts_clean_memory_after_restart(
         async def backend(self, _chat_id: str, _mode: AgentMode) -> object:
             return object()
 
-        async def push(self, _chat_id: str, _backend: object) -> None:
-            return None
-
-        async def pull(self, _chat_id: str, _backend: object) -> None:
-            return None
-
     def model(state: State) -> State:
         requests = [
             str(message.content)
@@ -354,12 +389,6 @@ async def test_restored_checkpoint_is_a_durable_head_not_a_volatile_pin(
     class Sandboxes:
         async def backend(self, _chat_id: str, _mode: AgentMode) -> object:
             return object()
-
-        async def push(self, _chat_id: str, _backend: object) -> None:
-            return None
-
-        async def pull(self, _chat_id: str, _backend: object) -> None:
-            return None
 
     def model(state: State) -> State:
         requests = [
@@ -485,12 +514,6 @@ async def test_delete_chat_waits_for_active_agent_run(
         async def backend(self, _chat_id, _mode):
             return object()
 
-        async def push(self, _chat_id, _backend):
-            return None
-
-        async def pull(self, _chat_id, _backend):
-            return None
-
     class WaitingGraph:
         async def astream_events(self, *_args, **_kwargs):
             started.set()
@@ -543,12 +566,6 @@ async def test_failed_run_keeps_the_prelocked_agent_mode(
         async def backend(self, _chat_id: str, _mode: AgentMode):
             return object()
 
-        async def push(self, _chat_id: str, _backend) -> None:
-            return None
-
-        async def pull(self, _chat_id: str, _backend) -> None:
-            return None
-
     class FailingGraph:
         async def astream_events(self, *_args, **_kwargs):
             if False:
@@ -558,7 +575,7 @@ async def test_failed_run_keeps_the_prelocked_agent_mode(
     database = tmp_path / "checkpoints.sqlite3"
     bindings = ChatBindings(database, ("local",))
     bindings.open("chat-1", "local")
-    bindings.select_mode("chat-1", AgentMode.EXTENDED)
+    bindings.select_mode("chat-1", AgentMode.HOST_FILES)
     bindings.lock("chat-1")
     execution = DeepAgentExecution(
         database,
@@ -577,10 +594,10 @@ async def test_failed_run_keeps_the_prelocked_agent_mode(
 
     binding = bindings.get("chat-1")
     assert binding is not None
-    assert binding.mode is AgentMode.EXTENDED
+    assert binding.mode is AgentMode.HOST_FILES
     assert binding.mode_locked is True
     with pytest.raises(ValueError, match="cannot change"):
-        bindings.select_mode("chat-1", AgentMode.READ_ONLY)
+        bindings.select_mode("chat-1", AgentMode.CHAT_FILES)
 
 
 @pytest.mark.asyncio
@@ -610,12 +627,6 @@ async def test_run_allows_a_finite_graph_beyond_langgraph_default_limit(
         async def backend(self, _chat_id: str, _mode: AgentMode) -> object:
             return object()
 
-        async def push(self, _chat_id: str, _backend: object) -> None:
-            return None
-
-        async def pull(self, _chat_id: str, _backend: object) -> None:
-            return None
-
     database = tmp_path / "checkpoints.sqlite3"
     bindings = ChatBindings(database, ("local",))
     bindings.open("chat-1", "local")
@@ -644,12 +655,6 @@ async def test_run_never_replays_the_graph_after_an_empty_stream_timeout(
     class Sandboxes:
         async def backend(self, _chat_id: str, _mode: AgentMode) -> object:
             return object()
-
-        async def push(self, _chat_id: str, _backend: object) -> None:
-            return None
-
-        async def pull(self, _chat_id: str, _backend: object) -> None:
-            return None
 
     class State(TypedDict):
         messages: list[object]
@@ -729,12 +734,6 @@ async def test_stream_timeout_does_not_replay_a_materialized_restore(
     class Sandboxes:
         async def backend(self, _chat_id: str, _mode: AgentMode) -> object:
             return object()
-
-        async def push(self, _chat_id: str, _backend: object) -> None:
-            return None
-
-        async def pull(self, _chat_id: str, _backend: object) -> None:
-            return None
 
     calls = {"tool": 0, "model": 0}
     revising = False
@@ -829,12 +828,6 @@ async def test_run_propagates_timeout_with_an_open_tool_without_replay(
         async def backend(self, _chat_id: str, _mode: AgentMode) -> object:
             return object()
 
-        async def push(self, _chat_id: str, _backend: object) -> None:
-            return None
-
-        async def pull(self, _chat_id: str, _backend: object) -> None:
-            return None
-
     class StalledToolGraph:
         def __init__(self) -> None:
             self.calls = 0
@@ -884,12 +877,6 @@ async def test_run_propagates_timeout_after_a_tool_error_without_replay(
     class Sandboxes:
         async def backend(self, _chat_id: str, _mode: AgentMode) -> object:
             return object()
-
-        async def push(self, _chat_id: str, _backend: object) -> None:
-            return None
-
-        async def pull(self, _chat_id: str, _backend: object) -> None:
-            return None
 
     class FailedToolGraph:
         def __init__(self) -> None:

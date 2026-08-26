@@ -1,287 +1,181 @@
-import asyncio
-import json
-import os
-import sys
-import threading
 from pathlib import Path
 
 import pytest
 from deepagents.middleware.filesystem import supports_execution
 
-from local_agent_chat.agent_modes import (
-    EXTENDED_FILESYSTEM_TOOLS,
-    READ_ONLY_FILESYSTEM_TOOLS,
-    AgentMode,
-)
+from local_agent_chat.agent_modes import READ_FILESYSTEM_TOOLS, AgentMode
 from local_agent_chat.sandbox_files import SandboxFiles
 from local_agent_chat.sandbox_provider import LocalSandboxManager
 
+FORBIDDEN_AGENT_TOOLS = {
+    "write_file",
+    "edit_file",
+    "delete",
+    "delete_file",
+    "execute",
+}
 
-def test_agent_modes_have_explicit_monotonic_tool_allowlists() -> None:
-    assert READ_ONLY_FILESYSTEM_TOOLS == ("ls", "read_file", "glob", "grep")
-    assert EXTENDED_FILESYSTEM_TOOLS == (
-        "ls",
-        "read_file",
-        "write_file",
-        "edit_file",
-        "delete",
-        "glob",
-        "grep",
-        "execute",
+
+def sandbox_files(tmp_path: Path) -> SandboxFiles:
+    return SandboxFiles(
+        tmp_path / "sandboxes",
+        max_file_bytes=1024,
+        max_chat_bytes=4096,
     )
-    assert set(READ_ONLY_FILESYSTEM_TOOLS) < set(EXTENDED_FILESYSTEM_TOOLS)
+
+
+def test_agent_modes_share_one_explicit_read_only_tool_allowlist() -> None:
+    assert READ_FILESYSTEM_TOOLS == ("ls", "read_file", "glob", "grep")
+    assert FORBIDDEN_AGENT_TOOLS.isdisjoint(READ_FILESYSTEM_TOOLS)
+
+
+async def assert_backend_has_no_generic_mutation_or_execution(
+    backend, target: Path
+) -> None:
+    write = await backend.awrite(str(target), "changed")
+    edit = await backend.aedit(str(target), "original", "changed")
+    delete = await backend.adelete(str(target))
+
+    assert write.error and "read-only" in write.error
+    assert edit.error and "read-only" in edit.error
+    assert delete.error and "read-only" in delete.error
+    assert supports_execution(backend) is False
+    with pytest.raises(NotImplementedError, match="doesn't support"):
+        await backend.aexecute("true")
 
 
 @pytest.mark.asyncio
-async def test_local_sandbox_runs_python_in_chat_files_without_app_secrets(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-sandbox")
-    files = SandboxFiles(
-        tmp_path / "sandboxes", max_file_bytes=100, max_chat_bytes=1000
-    )
-    files.files_dir("chat-1").joinpath("input.txt").write_text(
-        "hello", encoding="utf-8"
-    )
-    victim = tmp_path / "must-not-be-cleared"
-    victim.mkdir()
-    victim.joinpath("sentinel").write_text("safe", encoding="utf-8")
-    environment_root = files.environment_dir("chat-1")
-    environment_root.joinpath("venv").symlink_to(victim, target_is_directory=True)
+async def test_chat_files_backend_reads_only_uploaded_files(tmp_path: Path) -> None:
+    files = sandbox_files(tmp_path)
+    chat_files = files.files_dir("chat-1")
+    uploaded = chat_files / "report.txt"
+    uploaded.write_text("uploaded content", encoding="utf-8")
+    external = tmp_path / "external.txt"
+    external.write_text("host content", encoding="utf-8")
+    other_chat = files.files_dir("chat-2") / "private.txt"
+    other_chat.write_text("other chat", encoding="utf-8")
+    escape = chat_files / "escape.txt"
+    escape.symlink_to(external)
+
     manager = LocalSandboxManager(files)
+    backend = await manager.backend("chat-1", AgentMode.CHAT_FILES)
 
-    backend = await manager.backend("chat-1", AgentMode.EXTENDED)
-    result = await backend.aexecute(
-        "python -c 'from pathlib import Path; "
-        'Path("result.txt").write_text(Path("input.txt").read_text().upper())\''
-    )
-    environment = await backend.aexecute(
-        "python -c 'import importlib.util,json,os,sys; "
-        'print(json.dumps({"executable":sys.executable,"prefix":sys.prefix,'
-        '"home":os.environ["HOME"],"tmp":os.environ["TMPDIR"],'
-        '"virtual_env":os.environ["VIRTUAL_ENV"],"path":os.environ["PATH"],'
-        '"deepagents":importlib.util.find_spec("deepagents") is not None}))\''
-    )
-    pip = await backend.aexecute("python -m pip --version")
+    read = await backend.aread("/report.txt")
+    assert read.error is None
+    assert read.file_data is not None
+    assert read.file_data["content"] == "uploaded content"
+    assert (await backend.aread(str(external))).error
+    assert (await backend.aread(str(other_chat))).error
+    with pytest.raises(ValueError, match="outside root"):
+        await backend.aread("/escape.txt")
+    with pytest.raises(ValueError, match="traversal"):
+        await backend.aread("../external.txt")
 
-    assert result.exit_code == 0, result.output
-    assert environment.exit_code == 0, environment.output
-    details = json.loads(environment.output)
-    virtualenv = environment_root / "venv"
-    executable_dir = virtualenv / ("Scripts" if os.name == "nt" else "bin")
-    assert (
-        files.files_dir("chat-1").joinpath("result.txt").read_text(encoding="utf-8")
-        == "HELLO"
-    )
-    assert Path(details["prefix"]) == virtualenv
-    assert Path(details["executable"]).is_relative_to(virtualenv)
-    assert Path(details["home"]).is_relative_to(environment_root)
-    assert Path(details["tmp"]).is_relative_to(environment_root)
-    assert details["virtual_env"] == str(virtualenv)
-    assert details["path"].split(os.pathsep)[0] == str(executable_dir)
-    if sys.prefix != sys.base_prefix:
-        assert str(Path(sys.executable).parent) not in details["path"].split(os.pathsep)
-    assert details["deepagents"] is False
-    assert str(virtualenv) in pip.output
-    assert "OPENAI_API_KEY" not in (await backend.aexecute("env")).output
-    assert set(files.manifest("chat-1")) == {"input.txt", "result.txt"}
-    assert victim.joinpath("sentinel").read_text(encoding="utf-8") == "safe"
-    assert virtualenv.joinpath(".local-agent-chat-ready").is_file()
-    assert await manager.backend("chat-1", AgentMode.EXTENDED) is backend
+    late_upload = chat_files / "later.txt"
+    late_upload.write_text("available without rebuilding", encoding="utf-8")
+    late_read = await backend.aread("/later.txt")
+    assert late_read.file_data is not None
+    assert late_read.file_data["content"] == "available without rebuilding"
+
+    await assert_backend_has_no_generic_mutation_or_execution(backend, uploaded)
+    assert uploaded.read_text(encoding="utf-8") == "uploaded content"
+    assert external.read_text(encoding="utf-8") == "host content"
 
 
 @pytest.mark.asyncio
-async def test_file_tools_and_shell_share_absolute_chat_paths(
+async def test_host_files_backend_reads_real_absolute_paths_without_mutation(
     tmp_path: Path,
 ) -> None:
-    files = SandboxFiles(
-        tmp_path / "sandboxes", max_file_bytes=100, max_chat_bytes=1000
-    )
-    backend = await LocalSandboxManager(files).backend("chat-1", AgentMode.EXTENDED)
-    script = files.files_dir("chat-1") / "test_things.py"
+    files = sandbox_files(tmp_path)
+    external = tmp_path / "external.txt"
+    external.write_text("host content", encoding="utf-8")
+    other_chat = files.files_dir("chat-2") / "private.txt"
+    other_chat.write_text("other chat", encoding="utf-8")
+    backend = await LocalSandboxManager(files).backend("chat-1", AgentMode.HOST_FILES)
 
-    write = await backend.awrite(str(script), 'print("reachable")\n')
-    result = await backend.aexecute("python test_things.py")
+    external_read = await backend.aread(str(external))
+    other_chat_read = await backend.aread(str(other_chat))
 
-    assert write.error is None
-    assert result.exit_code == 0, result.output
-    assert result.output.strip() == "reachable"
-    assert script.is_file()
-    mirrored = files.files_dir("chat-1") / str(script).lstrip("/")
-    assert not mirrored.exists()
+    assert external_read.file_data is not None
+    assert external_read.file_data["content"] == "host content"
+    assert other_chat_read.file_data is not None
+    assert other_chat_read.file_data["content"] == "other chat"
+    await assert_backend_has_no_generic_mutation_or_execution(backend, external)
+    assert external.read_text(encoding="utf-8") == "host content"
 
 
 @pytest.mark.asyncio
-async def test_internal_artifact_paths_route_to_revisioned_chat_storage(
-    tmp_path: Path,
+@pytest.mark.parametrize("mode", list(AgentMode))
+async def test_project_skills_are_readable_in_both_modes(
+    tmp_path: Path, mode: AgentMode
 ) -> None:
-    files = SandboxFiles(
-        tmp_path / "sandboxes", max_file_bytes=100, max_chat_bytes=1000
-    )
-    backend = await LocalSandboxManager(files).backend("chat-1", AgentMode.READ_ONLY)
+    files = sandbox_files(tmp_path)
+    skills = tmp_path / "skills"
+    skill = skills / "incident-summary"
+    reference = skill / "references" / "format.md"
+    reference.parent.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# Incident summary", encoding="utf-8")
+    reference.write_text("timeline format", encoding="utf-8")
+    adjacent = tmp_path / "not-a-skill.txt"
+    adjacent.write_text("private host file", encoding="utf-8")
+    backend = await LocalSandboxManager(
+        files,
+        system_read_roots=(skills,),
+    ).backend("chat-1", mode)
+
+    skill_read = await backend.aread(str(skill / "SKILL.md"))
+    reference_read = await backend.aread(str(reference))
+
+    assert skill_read.file_data is not None
+    assert skill_read.file_data["content"] == "# Incident summary"
+    assert reference_read.file_data is not None
+    assert reference_read.file_data["content"] == "timeline format"
+    if mode is AgentMode.CHAT_FILES:
+        assert (await backend.aread(str(adjacent))).error
+
+
+def test_missing_system_read_root_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="System read root does not exist"):
+        LocalSandboxManager(
+            sandbox_files(tmp_path),
+            system_read_roots=(tmp_path / "missing-skills",),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", list(AgentMode))
+async def test_internal_artifacts_remain_writable_for_context_offload(
+    tmp_path: Path, mode: AgentMode
+) -> None:
+    files = sandbox_files(tmp_path)
+    backend = await LocalSandboxManager(files).backend("chat-1", mode)
     artifacts = files.artifacts_dir("chat-1")
     artifact = artifacts / "large_tool_results" / "result.txt"
 
-    write = await backend.awrite(str(artifact), "stored in the Chat")
+    write = await backend.awrite(str(artifact), "internal context")
 
     assert write.error is None
-    assert artifact.read_text(encoding="utf-8") == "stored in the Chat"
+    assert artifact.read_text(encoding="utf-8") == "internal context"
     assert backend.artifacts_root == str(artifacts)
-    assert set(backend.routes) == {f"{artifacts}/"}
     assert files.manifest("chat-1") == {}
 
 
 @pytest.mark.asyncio
-async def test_read_only_backend_reads_absolute_host_paths_without_mutation_or_venv(
-    tmp_path: Path,
-) -> None:
-    external = tmp_path / "external.txt"
-    external.write_text("host content", encoding="utf-8")
-    files = SandboxFiles(
-        tmp_path / "sandboxes", max_file_bytes=100, max_chat_bytes=1000
-    )
-    backend = await LocalSandboxManager(files).backend("chat-1", AgentMode.READ_ONLY)
-
-    read = await backend.aread(str(external))
-    write = await backend.awrite(str(external), "changed")
-    edit = await backend.aedit(str(external), "host", "guest")
-    delete = await backend.adelete(str(external))
-
-    assert read.error is None
-    assert read.file_data is not None
-    assert read.file_data["content"] == "host content"
-    assert write.error and "Read-only" in write.error
-    assert edit.error and "Read-only" in edit.error
-    assert delete.error and "Read-only" in delete.error
-    assert external.read_text(encoding="utf-8") == "host content"
-    assert supports_execution(backend) is False
-    with pytest.raises(NotImplementedError, match="doesn't support"):
-        await backend.aexecute("true")
-    assert not (tmp_path / "sandboxes" / "chat-1" / "environment").exists()
-
-
-@pytest.mark.asyncio
-async def test_extended_file_tools_and_shell_share_global_absolute_paths(
-    tmp_path: Path,
-) -> None:
-    files = SandboxFiles(
-        tmp_path / "sandboxes", max_file_bytes=100, max_chat_bytes=1000
-    )
-    backend = await LocalSandboxManager(files).backend("chat-1", AgentMode.EXTENDED)
-    external = tmp_path / "outside-chat.txt"
-
-    write = await backend.awrite(str(external), "same path")
-    command = await backend.aexecute(
-        "python -c 'from pathlib import Path; "
-        f"print(Path({json.dumps(str(external))}).read_text())'"
-    )
-
-    assert write.error is None
-    assert command.exit_code == 0, command.output
-    assert command.output.strip() == "same path"
-    assert external.read_text(encoding="utf-8") == "same path"
-    assert supports_execution(backend) is True
-
-
-@pytest.mark.asyncio
-async def test_each_chat_gets_a_distinct_persistent_python_environment(
-    tmp_path: Path,
-) -> None:
-    files = SandboxFiles(
-        tmp_path / "sandboxes", max_file_bytes=100, max_chat_bytes=1000
-    )
-    first_manager = LocalSandboxManager(files)
-    first = await first_manager.backend("chat-1", AgentMode.EXTENDED)
-    second = await first_manager.backend("chat-2", AgentMode.EXTENDED)
-
-    first_prefix = await first.aexecute("python -c 'import sys;print(sys.prefix)'")
-    second_prefix = await second.aexecute("python -c 'import sys;print(sys.prefix)'")
-
-    assert first_prefix.output.strip() != second_prefix.output.strip()
-    reopened = await LocalSandboxManager(files).backend("chat-1", AgentMode.EXTENDED)
-    reopened_prefix = await reopened.aexecute(
-        "python -c 'import sys;print(sys.prefix)'"
-    )
-    assert reopened_prefix.output.strip() == first_prefix.output.strip()
-
-
-@pytest.mark.asyncio
-async def test_cancelled_backend_bootstrap_is_shared_with_the_next_request(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    files = SandboxFiles(
-        tmp_path / "sandboxes", max_file_bytes=100, max_chat_bytes=1000
-    )
-    manager = LocalSandboxManager(files)
-    started = threading.Event()
-    release = threading.Event()
-    calls = 0
-
-    def slow_environment(_chat_id: str) -> dict[str, str]:
-        nonlocal calls
-        calls += 1
-        started.set()
-        release.wait(timeout=5)
-        return {"PATH": os.defpath}
-
-    monkeypatch.setattr(manager, "_command_environment", slow_environment)
-    first = asyncio.create_task(manager.backend("chat-1", AgentMode.EXTENDED))
-    assert await asyncio.to_thread(started.wait, 2)
-    first.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await first
-
-    second = asyncio.create_task(manager.backend("chat-1", AgentMode.EXTENDED))
-    await asyncio.sleep(0)
-    release.set()
-
-    assert await second is not None
-    assert calls == 1
-
-
-@pytest.mark.asyncio
-async def test_delete_waits_for_bootstrap_and_prevents_chat_recreation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    files = SandboxFiles(
-        tmp_path / "sandboxes", max_file_bytes=100, max_chat_bytes=1000
-    )
-    manager = LocalSandboxManager(files)
-    started = threading.Event()
-    release = threading.Event()
-
-    def slow_environment(chat_id: str) -> dict[str, str]:
-        started.set()
-        release.wait(timeout=5)
-        files.environment_dir(chat_id).joinpath("created").write_text("done")
-        return {"PATH": os.defpath}
-
-    monkeypatch.setattr(manager, "_command_environment", slow_environment)
-    backend_task = asyncio.create_task(manager.backend("chat-1", AgentMode.EXTENDED))
-    assert await asyncio.to_thread(started.wait, 2)
-    delete_task = asyncio.create_task(manager.delete_chat("chat-1"))
-    await asyncio.sleep(0)
-    release.set()
-
-    with pytest.raises(RuntimeError, match="being deleted"):
-        await backend_task
-    await delete_task
-    await files.delete_chat("chat-1")
-    assert not (tmp_path / "sandboxes" / "chat-1").exists()
-    with pytest.raises(RuntimeError, match="being deleted"):
-        await manager.backend("chat-1", AgentMode.EXTENDED)
-    assert not (tmp_path / "sandboxes" / "chat-1").exists()
-
-
-@pytest.mark.asyncio
 async def test_manager_keeps_chat_mode_immutable(tmp_path: Path) -> None:
-    files = SandboxFiles(
-        tmp_path / "sandboxes", max_file_bytes=100, max_chat_bytes=1000
-    )
-    manager = LocalSandboxManager(files)
+    manager = LocalSandboxManager(sandbox_files(tmp_path))
+    backend = await manager.backend("chat-1", AgentMode.CHAT_FILES)
 
-    backend = await manager.backend("chat-1", AgentMode.READ_ONLY)
-
-    assert await manager.backend("chat-1", AgentMode.READ_ONLY) is backend
+    assert await manager.backend("chat-1", AgentMode.CHAT_FILES) is backend
     with pytest.raises(ValueError, match="immutable"):
-        await manager.backend("chat-1", AgentMode.EXTENDED)
+        await manager.backend("chat-1", AgentMode.HOST_FILES)
+
+
+@pytest.mark.asyncio
+async def test_deleted_chat_cannot_recreate_a_backend(tmp_path: Path) -> None:
+    manager = LocalSandboxManager(sandbox_files(tmp_path))
+    await manager.backend("chat-1", AgentMode.CHAT_FILES)
+
+    await manager.delete_chat("chat-1")
+
+    with pytest.raises(RuntimeError, match="being deleted"):
+        await manager.backend("chat-1", AgentMode.CHAT_FILES)

@@ -1,1 +1,1 @@
-"""Local Agent Chat application package."""
+"""LocalChat application package."""
