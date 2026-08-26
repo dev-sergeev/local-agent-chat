@@ -39,6 +39,11 @@ def _short(value: Any, limit: int = 64) -> str:
     return text if len(text) <= limit else f"{text[: limit - 1]}…"
 
 
+def _short_path(value: Any, limit: int = 64) -> str:
+    text = str(value or "").strip().splitlines()[0] if value else ""
+    return text if len(text) <= limit else f"…{text[-(limit - 1) :]}"
+
+
 def _json_input(data: dict[str, Any], fallback: str) -> str:
     if not data:
         return fallback
@@ -53,11 +58,11 @@ def _shell_input(data: dict[str, Any], fallback: str) -> str:
 def tool_display(name: str, input_text: str) -> ToolDisplay:
     data = _input_dict(input_text)
     rendered_input = _json_input(data, input_text)
-    path = _short(
-        data.get("file_path")
-        or data.get("path")
-        or data.get("pattern")
-        or data.get("glob_pattern")
+    file_path = data.get("file_path") or data.get("path")
+    path = (
+        _short_path(file_path)
+        if file_path
+        else _short(data.get("pattern") or data.get("glob_pattern"))
     )
     suffix = f" · {path}" if path else ""
 

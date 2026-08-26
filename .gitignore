@@ -4,6 +4,7 @@
 .venv/
 models.yaml
 .local-agent-chat/
+.files/
 __pycache__/
 .pytest_cache/
 .ruff_cache/

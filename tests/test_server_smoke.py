@@ -3,9 +3,11 @@ import socket
 import sqlite3
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 import requests
+import socketio
 
 
 def test_chainlit_server_works_behind_root_path(tmp_path: Path) -> None:
@@ -40,6 +42,13 @@ def test_chainlit_server_works_behind_root_path(tmp_path: Path) -> None:
         text=True,
     )
     session = requests.Session()
+    websocket = socketio.Client(
+        http_session=session,
+        reconnection=False,
+        logger=False,
+        engineio_logger=False,
+    )
+    websocket_session_id = str(uuid.uuid4())
     try:
         root = f"http://127.0.0.1:{port}{prefix}"
         for _ in range(120):
@@ -67,6 +76,39 @@ def test_chainlit_server_works_behind_root_path(tmp_path: Path) -> None:
         assert socket_response.status_code == 200
         assert socket_response.text.startswith("0{")
         assert session.post(f"{root}/auth/header", timeout=2).status_code == 200
+        persisted_blob = tmp_path / "data" / "blobs" / "smoke" / "persisted.txt"
+        persisted_blob.parent.mkdir(parents=True, exist_ok=True)
+        persisted_blob.write_bytes(b"persisted attachment")
+        persisted_download = session.get(f"{root}/files/smoke/persisted.txt", timeout=2)
+        assert persisted_download.status_code == 200
+        assert persisted_download.content == b"persisted attachment"
+        assert persisted_download.headers["content-type"].startswith("text/plain")
+        websocket.connect(
+            f"http://127.0.0.1:{port}",
+            socketio_path="/ws/socket.io",
+            transports=["websocket"],
+            auth={
+                "sessionId": websocket_session_id,
+                "userEnv": "{}",
+                "clientType": "webapp",
+            },
+            wait_timeout=2,
+        )
+        upload = session.post(
+            f"{root}/project/file",
+            params={"session_id": websocket_session_id},
+            files={"file": ("script.py", b"", "text/x-python")},
+            timeout=2,
+        )
+        assert upload.status_code == 200
+        file_id = upload.json()["id"]
+        download = session.get(
+            f"{root}/project/file/{file_id}",
+            params={"session_id": websocket_session_id},
+            timeout=2,
+        )
+        assert download.status_code == 200
+        assert download.content == b""
         database = tmp_path / "data" / "chainlit.sqlite3"
         with sqlite3.connect(database) as connection:
             user_id = connection.execute(
@@ -106,6 +148,7 @@ def test_chainlit_server_works_behind_root_path(tmp_path: Path) -> None:
         assert settings["threadResumable"] is True
         assert settings["features"]["edit_message"] is True
         assert settings["features"]["spontaneous_file_upload"]["max_size_mb"] == 100
+        assert settings["features"]["spontaneous_file_upload"]["accept"] == []
         assert settings["ui"]["cot"] == "tool_call"
         assert settings["ui"]["language"] == "ru-RU"
         assert settings["ui"]["layout"] == "wide"
@@ -118,5 +161,8 @@ def test_chainlit_server_works_behind_root_path(tmp_path: Path) -> None:
             "Напишите сообщение..."
         )
     finally:
+        if websocket.connected:
+            websocket.emit("clear_session")
+            websocket.disconnect()
         process.terminate()
         process.wait(timeout=10)

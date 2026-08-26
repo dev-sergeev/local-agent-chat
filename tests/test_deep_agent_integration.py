@@ -7,15 +7,17 @@ from langchain_core.language_models.fake_chat_models import (
     FakeMessagesListChatModel,
 )
 from langchain_core.messages import AIMessage
+from langchain_openai import StreamChunkTimeoutError
 
-import local_agent_chat.agent_service as agent_module
+import local_agent_chat.deep_agent_execution as execution_module
 from local_agent_chat.agent_events import TextDelta, ToolFinished, ToolStarted
 from local_agent_chat.agent_modes import AgentMode
-from local_agent_chat.agent_service import AgentService
+from local_agent_chat.chat_bindings import ChatBindings
+from local_agent_chat.deep_agent_execution import DeepAgentExecution
 from local_agent_chat.runtime import Turn
 from local_agent_chat.sandbox_files import SandboxFiles
 from local_agent_chat.sandbox_provider import LocalSandboxManager
-from local_agent_chat.settings import ModelProfile
+from local_agent_chat.settings import LLMRetryConfig, ModelProfile
 from local_agent_chat.sqlite_history import SQLiteHistory
 
 
@@ -27,6 +29,16 @@ class ToolAwareFakeModel(FakeMessagesListChatModel):
 class StreamingToolAwareFakeModel(FakeListChatModel):
     def bind_tools(self, tools, **kwargs):
         return self
+
+
+class RecoveringSubagentFakeModel(ToolAwareFakeModel):
+    calls: int = 0
+
+    def _generate(self, *args, **kwargs):
+        self.calls += 1
+        if self.calls == 2:
+            raise StreamChunkTimeoutError(0.01, chunks_received=0)
+        return super()._generate(*args, **kwargs)
 
 
 class StateSandboxManager:
@@ -47,6 +59,71 @@ class StateSandboxManager:
 
 
 @pytest.mark.asyncio
+async def test_retry_configured_model_reaches_default_subagent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_model = RecoveringSubagentFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "Return a short reliability report",
+                            "subagent_type": "general-purpose",
+                        },
+                        "id": "delegate-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="subagent report"),
+            AIMessage(content="main agent result"),
+        ]
+    )
+    init_kwargs: list[dict[str, object]] = []
+
+    def fake_init_chat_model(*_args, **kwargs):
+        init_kwargs.append(kwargs)
+        return fake_model
+
+    monkeypatch.setattr(execution_module, "init_chat_model", fake_init_chat_model)
+    profile = ModelProfile("test", "Test", "openai:test", "TEST_KEY", "key")
+    database = tmp_path / "checkpoints.sqlite3"
+    bindings = ChatBindings(database, (profile.id,))
+    bindings.open("chat-1", profile.id)
+    bindings.lock("chat-1")
+    execution = DeepAgentExecution(
+        database,
+        (profile,),
+        StateSandboxManager(),  # type: ignore[arg-type]
+        llm_retry=LLMRetryConfig(max_retries=6, stream_retries=1),
+        chat_bindings=bindings,
+    )
+    events = []
+
+    async def record(event) -> None:
+        events.append(event)
+
+    assert await execution.run("chat-1", "delegate", record) == "main agent result"
+    assert fake_model.calls == 4
+    assert (
+        sum(isinstance(event, ToolStarted) and event.name == "task" for event in events)
+        == 1
+    )
+    assert init_kwargs == [
+        {
+            "api_key": "key",
+            "max_retries": 6,
+            "timeout": 60.0,
+            "stream_chunk_timeout": 120.0,
+        }
+    ]
+    await execution.close()
+
+
+@pytest.mark.asyncio
 async def test_deep_agent_uses_sqlite_checkpoint_and_can_restart_from_empty_revision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -58,20 +135,26 @@ async def test_deep_agent_uses_sqlite_checkpoint_and_can_restart_from_empty_revi
         ]
     )
     monkeypatch.setattr(
-        agent_module, "init_chat_model", lambda *args, **kwargs: fake_model
+        execution_module, "init_chat_model", lambda *args, **kwargs: fake_model
     )
     profile = ModelProfile("test", "Test", "openai:test", "TEST_KEY", "key")
-    service = AgentService(
-        tmp_path / "checkpoints.sqlite3", (profile,), StateSandboxManager()
+    database = tmp_path / "checkpoints.sqlite3"
+    bindings = ChatBindings(database, (profile.id,))
+    bindings.open("chat-1", profile.id)
+    bindings.lock("chat-1")
+    execution = DeepAgentExecution(
+        database,
+        (profile,),
+        StateSandboxManager(),
+        chat_bindings=bindings,
     )  # type: ignore[arg-type]
-    service.set_profile("chat-1", "test")
 
-    before_first = await service.checkpoint("chat-1")
-    assert await service.run("chat-1", "one") == "first"
-    assert await service.run("chat-1", "two") == "second"
-    await service.restore("chat-1", before_first)
-    assert await service.run("chat-1", "changed") == "revised"
-    await service.close()
+    before_first = await execution.checkpoint("chat-1")
+    assert await execution.run("chat-1", "one") == "first"
+    assert await execution.run("chat-1", "two") == "second"
+    await execution.restore("chat-1", before_first)
+    assert await execution.run("chat-1", "changed") == "revised"
+    await execution.close()
 
 
 @pytest.mark.asyncio
@@ -95,20 +178,26 @@ async def test_deep_agent_emits_safe_tool_lifecycle_events(
         ]
     )
     monkeypatch.setattr(
-        agent_module, "init_chat_model", lambda *args, **kwargs: fake_model
+        execution_module, "init_chat_model", lambda *args, **kwargs: fake_model
     )
     profile = ModelProfile("test", "Test", "openai:test", "TEST_KEY", "key")
-    service = AgentService(
-        tmp_path / "checkpoints.sqlite3", (profile,), StateSandboxManager()
+    database = tmp_path / "checkpoints.sqlite3"
+    bindings = ChatBindings(database, (profile.id,))
+    bindings.open("chat-1", profile.id)
+    bindings.select_mode("chat-1", AgentMode.EXTENDED)
+    bindings.lock("chat-1")
+    execution = DeepAgentExecution(
+        database,
+        (profile,),
+        StateSandboxManager(),
+        chat_bindings=bindings,
     )  # type: ignore[arg-type]
-    service.set_profile("chat-1", "test")
-    service.select_mode("chat-1", AgentMode.EXTENDED)
     events = []
 
     async def record(event) -> None:
         events.append(event)
 
-    answer = await service.run("chat-1", "write a file", record)
+    answer = await execution.run("chat-1", "write a file", record)
 
     assert answer == "finished"
     assert isinstance(events[0], ToolStarted)
@@ -118,7 +207,7 @@ async def test_deep_agent_emits_safe_tool_lifecycle_events(
     assert events[1].id == events[0].id
     assert "hello.txt" in events[1].output
     assert not any(isinstance(event, TextDelta) for event in events)
-    await service.close()
+    await execution.close()
 
 
 @pytest.mark.asyncio
@@ -126,26 +215,32 @@ async def test_deep_agent_streams_public_answer_text(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        agent_module,
+        execution_module,
         "init_chat_model",
         lambda *args, **kwargs: StreamingToolAwareFakeModel(responses=["streamed"]),
     )
     profile = ModelProfile("test", "Test", "openai:test", "TEST_KEY", "key")
-    service = AgentService(
-        tmp_path / "checkpoints.sqlite3", (profile,), StateSandboxManager()
+    database = tmp_path / "checkpoints.sqlite3"
+    bindings = ChatBindings(database, (profile.id,))
+    bindings.open("chat-1", profile.id)
+    bindings.lock("chat-1")
+    execution = DeepAgentExecution(
+        database,
+        (profile,),
+        StateSandboxManager(),
+        chat_bindings=bindings,
     )  # type: ignore[arg-type]
-    service.set_profile("chat-1", "test")
     deltas: list[str] = []
 
     async def record(event) -> None:
         if isinstance(event, TextDelta):
             deltas.append(event.text)
 
-    answer = await service.run("chat-1", "answer", record)
+    answer = await execution.run("chat-1", "answer", record)
 
     assert answer == "streamed"
     assert "".join(deltas) == "streamed"
-    await service.close()
+    await execution.close()
 
 
 @pytest.mark.asyncio
@@ -160,7 +255,7 @@ async def test_deep_agent_returns_complete_answer_when_streaming_is_disabled(
         fake_model.disable_streaming = kwargs.get("disable_streaming", False)
         return fake_model
 
-    monkeypatch.setattr(agent_module, "init_chat_model", fake_init_chat_model)
+    monkeypatch.setattr(execution_module, "init_chat_model", fake_init_chat_model)
     profile = ModelProfile(
         "test",
         "Test",
@@ -169,21 +264,27 @@ async def test_deep_agent_returns_complete_answer_when_streaming_is_disabled(
         "key",
         streaming=False,
     )
-    service = AgentService(
-        tmp_path / "checkpoints.sqlite3", (profile,), StateSandboxManager()
+    database = tmp_path / "checkpoints.sqlite3"
+    bindings = ChatBindings(database, (profile.id,))
+    bindings.open("chat-1", profile.id)
+    bindings.lock("chat-1")
+    execution = DeepAgentExecution(
+        database,
+        (profile,),
+        StateSandboxManager(),
+        chat_bindings=bindings,
     )  # type: ignore[arg-type]
-    service.set_profile("chat-1", "test")
     events = []
 
     async def record(event) -> None:
         events.append(event)
 
-    answer = await service.run("chat-1", "answer", record)
+    answer = await execution.run("chat-1", "answer", record)
 
     assert answer == "non-streamed answer"
     assert not any(isinstance(event, TextDelta) for event in events)
     assert model_kwargs[0]["disable_streaming"] is True
-    await service.close()
+    await execution.close()
 
 
 @pytest.mark.asyncio
@@ -209,23 +310,28 @@ async def test_read_only_agent_reads_a_global_absolute_path_without_a_venv(
         ]
     )
     monkeypatch.setattr(
-        agent_module, "init_chat_model", lambda *_args, **_kwargs: fake_model
+        execution_module, "init_chat_model", lambda *_args, **_kwargs: fake_model
     )
     files = SandboxFiles(
         tmp_path / "sandboxes", max_file_bytes=1024, max_chat_bytes=4096
     )
-    service = AgentService(
-        tmp_path / "checkpoints.sqlite3",
-        (ModelProfile("test", "Test", "openai:test", "TEST_KEY", "key"),),
+    profile = ModelProfile("test", "Test", "openai:test", "TEST_KEY", "key")
+    database = tmp_path / "checkpoints.sqlite3"
+    bindings = ChatBindings(database, (profile.id,))
+    bindings.open("chat-1", profile.id)
+    bindings.lock("chat-1")
+    execution = DeepAgentExecution(
+        database,
+        (profile,),
         LocalSandboxManager(files),
+        chat_bindings=bindings,
     )
-    service.set_profile("chat-1", "test")
     events = []
 
     async def record(event) -> None:
         events.append(event)
 
-    answer = await service.run("chat-1", "read the absolute file", record)
+    answer = await execution.run("chat-1", "read the absolute file", record)
 
     assert answer == "read complete"
     assert any(
@@ -233,7 +339,7 @@ async def test_read_only_agent_reads_a_global_absolute_path_without_a_venv(
         for event in events
     )
     assert not (tmp_path / "sandboxes" / "chat-1" / "environment").exists()
-    await service.close()
+    await execution.close()
 
 
 @pytest.mark.asyncio
@@ -258,23 +364,28 @@ async def test_read_only_agent_cannot_dispatch_a_forced_write_tool_call(
         ]
     )
     monkeypatch.setattr(
-        agent_module, "init_chat_model", lambda *_args, **_kwargs: fake_model
+        execution_module, "init_chat_model", lambda *_args, **_kwargs: fake_model
     )
     files = SandboxFiles(
         tmp_path / "sandboxes", max_file_bytes=1024, max_chat_bytes=4096
     )
-    service = AgentService(
-        tmp_path / "checkpoints.sqlite3",
-        (ModelProfile("test", "Test", "openai:test", "TEST_KEY", "key"),),
+    profile = ModelProfile("test", "Test", "openai:test", "TEST_KEY", "key")
+    database = tmp_path / "checkpoints.sqlite3"
+    bindings = ChatBindings(database, (profile.id,))
+    bindings.open("chat-1", profile.id)
+    bindings.lock("chat-1")
+    execution = DeepAgentExecution(
+        database,
+        (profile,),
         LocalSandboxManager(files),
+        chat_bindings=bindings,
     )
-    service.set_profile("chat-1", "test")
 
-    answer = await service.run("chat-1", "try to write")
+    answer = await execution.run("chat-1", "try to write")
 
     assert answer == "write unavailable"
     assert target.exists() is False
-    await service.close()
+    await execution.close()
 
 
 @pytest.mark.asyncio
@@ -324,24 +435,29 @@ async def test_read_only_agent_can_search_and_read_global_memory(
         ]
     )
     monkeypatch.setattr(
-        agent_module, "init_chat_model", lambda *_args, **_kwargs: fake_model
+        execution_module, "init_chat_model", lambda *_args, **_kwargs: fake_model
     )
-    service = AgentService(
-        tmp_path / "checkpoints.sqlite3",
-        (ModelProfile("test", "Test", "openai:test", "TEST_KEY", "key"),),
+    profile = ModelProfile("test", "Test", "openai:test", "TEST_KEY", "key")
+    database = tmp_path / "checkpoints.sqlite3"
+    bindings = ChatBindings(database, (profile.id,))
+    bindings.open("current-chat", profile.id)
+    bindings.lock("current-chat")
+    execution = DeepAgentExecution(
+        database,
+        (profile,),
         StateSandboxManager(),  # type: ignore[arg-type]
         global_memory=history,
+        chat_bindings=bindings,
     )
-    service.set_profile("current-chat", "test")
     events = []
 
     async def record(event) -> None:
         events.append(event)
 
-    answer = await service.run("current-chat", "Что мы выбрали раньше?", record)
+    answer = await execution.run("current-chat", "Что мы выбрали раньше?", record)
 
     assert answer == "В прошлый раз выбрали SQLite FTS5."
     tool_outputs = [event.output for event in events if isinstance(event, ToolFinished)]
     assert any('"turn_id":"past-turn"' in output for output in tool_outputs)
     assert any("SQLite FTS5" in output for output in tool_outputs)
-    await service.close()
+    await execution.close()

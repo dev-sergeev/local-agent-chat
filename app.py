@@ -2,25 +2,36 @@ from __future__ import annotations
 
 import asyncio
 import mimetypes
+from collections.abc import Awaitable
 from pathlib import Path
 
 import chainlit as cl
 from chainlit.input_widget import Switch
-from chainlit.server import app
+from chainlit.server import app, router
 from fastapi import HTTPException
 from fastapi.responses import FileResponse
+from langchain.chat_models import init_chat_model
 
 from local_agent_chat.agent_events import safe_text
 from local_agent_chat.agent_modes import AgentMode
-from local_agent_chat.agent_service import AgentService
+from local_agent_chat.auxiliary_labels import AuxiliaryLabels
 from local_agent_chat.chainlit_data import create_chainlit_data_layer
 from local_agent_chat.chainlit_mode_guard import install_mode_acceptance_guard
+from local_agent_chat.chainlit_stop import install_localized_stop_compatibility
 from local_agent_chat.chainlit_ui import ChainlitTurnView
+from local_agent_chat.chainlit_uploads import (
+    install_empty_file_upload_compatibility,
+    install_unrestricted_file_upload_compatibility,
+)
+from local_agent_chat.chat_bindings import ChatBinding, ChatBindings
+from local_agent_chat.chat_configuration import ChatConfigurations
 from local_agent_chat.chat_titles import (
     CHAT_TITLE_FALLBACK,
     CHAT_TITLE_PENDING,
     DEFAULT_CHAT_TITLE,
 )
+from local_agent_chat.deep_agent_execution import DeepAgentExecution
+from local_agent_chat.llm_retry import RetryBlock
 from local_agent_chat.local_storage import LocalStorageClient
 from local_agent_chat.proxy_prefix import (
     RestoreProxyMethodMiddleware,
@@ -35,6 +46,9 @@ from local_agent_chat.sqlite_history import SQLiteHistory
 settings = load_settings()
 app.add_middleware(RestoreProxyPrefixMiddleware, prefix=settings.root_path)
 app.add_middleware(RestoreProxyMethodMiddleware)
+install_empty_file_upload_compatibility()
+install_unrestricted_file_upload_compatibility()
+install_localized_stop_compatibility()
 settings.data_dir.mkdir(parents=True, exist_ok=True)
 storage = LocalStorageClient(settings.data_dir / "blobs", f"{settings.root_path}/files")
 chainlit_layer = create_chainlit_data_layer(
@@ -47,45 +61,38 @@ sandbox_files = SandboxFiles(
 )
 sandbox_manager = LocalSandboxManager(sandbox_files)
 runtime_history = SQLiteHistory(settings.data_dir / "runtime-history.sqlite3")
-agent_service = AgentService(
-    settings.data_dir / "checkpoints.sqlite3",
+checkpoint_database = settings.data_dir / "checkpoints.sqlite3"
+chat_bindings = ChatBindings(
+    checkpoint_database,
+    (model.id for model in settings.models),
+)
+retry_block = RetryBlock(settings.llm_retry, init_chat_model)
+auxiliary_labels = AuxiliaryLabels(settings.models, chat_bindings, retry_block)
+agent_execution = DeepAgentExecution(
+    checkpoint_database,
     settings.models,
     sandbox_manager,
     global_memory=runtime_history,
+    retry_block=retry_block,
+    skills_dir=Path(__file__).resolve().parent / "skills",
+    chat_bindings=chat_bindings,
 )
-
-
-def _lock_mode_at_message_acceptance(
-    chat_id: str, selected_profile: str | None
-) -> None:
-    profile_id = (
-        agent_service.profile_for(chat_id) or selected_profile or settings.models[0].id
-    )
-    agent_service.set_profile(chat_id, profile_id)
-    agent_service.lock_mode(chat_id)
-
-
-def _select_mode_at_settings_acceptance(
-    chat_id: str, selected_profile: str | None, extended: bool
-) -> None:
-    profile_id = (
-        agent_service.profile_for(chat_id) or selected_profile or settings.models[0].id
-    )
-    agent_service.set_profile(chat_id, profile_id)
-    requested = AgentMode.EXTENDED if extended else AgentMode.READ_ONLY
-    try:
-        agent_service.select_mode(chat_id, requested)
-    except ValueError:
-        pass
-
-
+chat_configurations = ChatConfigurations(
+    chat_bindings,
+    (model.id for model in settings.models),
+    chainlit_layer.has_user_request,
+)
 install_mode_acceptance_guard(
-    _select_mode_at_settings_acceptance,
-    _lock_mode_at_message_acceptance,
+    lambda chat_id, profile, extended: chat_configurations.select_mode(
+        chat_id,
+        AgentMode.EXTENDED if extended else AgentMode.READ_ONLY,
+        profile,
+    ),
+    chat_configurations.accept_message,
 )
 
 runtime = ChatRuntime(
-    agent=agent_service,
+    agent=agent_execution,
     sandbox=sandbox_files,
     history=runtime_history,
 )
@@ -93,6 +100,10 @@ active_views: dict[str, ChainlitTurnView] = {}
 chat_title_tasks: dict[str, asyncio.Task[None]] = {}
 chat_turn_locks: dict[str, asyncio.Lock] = {}
 deleting_chats: set[str] = set()
+
+
+class _TurnRunFailed(Exception):
+    """The Turn failure is already rendered for the user."""
 
 
 def _title_task_finished(chat_id: str, task: asyncio.Task[None]) -> None:
@@ -113,7 +124,7 @@ def _start_chat_title(chat_id: str, request_text: str) -> None:
 
 async def cleanup_chat(chat_id: str) -> None:
     deleting_chats.add(chat_id)
-    agent_service.mark_deleting(chat_id)
+    chat_bindings.mark_deleting(chat_id)
     title_task = chat_title_tasks.pop(chat_id, None)
     if title_task is not None:
         title_task.cancel()
@@ -121,7 +132,7 @@ async def cleanup_chat(chat_id: str) -> None:
     async with chat_turn_locks.setdefault(chat_id, asyncio.Lock()):
 
         async def delete_state() -> None:
-            await agent_service.delete_chat(chat_id)
+            await agent_execution.delete_chat(chat_id)
             await sandbox_manager.delete_chat(chat_id)
             await sandbox_files.delete_chat(chat_id)
             await runtime_history.delete_chat(chat_id)
@@ -178,14 +189,6 @@ def _thread_id() -> str:
     return cl.context.session.thread_id
 
 
-def _selected_profile(chat_id: str) -> str:
-    return (
-        agent_service.profile_for(chat_id)
-        or cl.user_session.get("chat_profile")
-        or settings.models[0].id
-    )
-
-
 async def _publish_chat_title(chat_id: str, request_text: str) -> None:
     """Persist and publish a semantic title without affecting the Turn."""
 
@@ -197,7 +200,7 @@ async def _publish_chat_title(chat_id: str, request_text: str) -> None:
             "first_interaction",
             {"interaction": DEFAULT_CHAT_TITLE, "thread_id": chat_id},
         )
-        title = await agent_service.describe_chat(chat_id, request_text)
+        title = await auxiliary_labels.describe_chat(chat_id, request_text)
         rendered = title or DEFAULT_CHAT_TITLE
         applied = await chainlit_layer.complete_chat_title(
             chat_id, rendered, fallback=title is None
@@ -211,16 +214,38 @@ async def _publish_chat_title(chat_id: str, request_text: str) -> None:
         return
 
 
-async def _send_chat_settings(*, refresh: bool = False) -> None:
-    chat_id = _thread_id()
-    mode = agent_service.mode_for(chat_id) or AgentMode.READ_ONLY
+def _remember_chat_configuration(binding: ChatBinding) -> None:
+    cl.user_session.set("model_profile", binding.profile_id)
+    cl.user_session.set("agent_mode", binding.mode.value)
+
+
+async def _persist_chat_configuration(chat_id: str, binding: ChatBinding) -> None:
+    await chainlit_layer.update_thread(
+        chat_id,
+        metadata={
+            "model_profile": binding.profile_id,
+            "agent_mode": binding.mode.value,
+            "agent_mode_locked": binding.mode_locked,
+        },
+    )
+
+
+async def _sync_chat_configuration(
+    chat_id: str, binding: ChatBinding, *, refresh: bool
+) -> None:
+    _remember_chat_configuration(binding)
+    await _persist_chat_configuration(chat_id, binding)
+    await _send_chat_settings(binding, refresh=refresh)
+
+
+async def _send_chat_settings(binding: ChatBinding, *, refresh: bool = False) -> None:
     detailed = bool(cl.user_session.get("show_tool_details", False))
     chat_settings = cl.ChatSettings(
         [
             Switch(
                 id="extended_mode",
                 label="Расширенный режим",
-                initial=mode is AgentMode.EXTENDED,
+                initial=binding.mode is AgentMode.EXTENDED,
                 tooltip=(
                     "Добавляет создание, изменение и удаление файлов, а также "
                     "выполнение команд. Выбор фиксируется после первого сообщения."
@@ -229,7 +254,7 @@ async def _send_chat_settings(*, refresh: bool = False) -> None:
                     "Выключено: чтение и поиск по диску. Включено: полный "
                     "доступ с правами процесса приложения."
                 ),
-                disabled=agent_service.mode_is_locked(chat_id),
+                disabled=binding.mode_locked,
             ),
             Switch(
                 id="show_tool_details",
@@ -245,48 +270,25 @@ async def _send_chat_settings(*, refresh: bool = False) -> None:
         await chat_settings.send()
 
 
-async def _recover_mode_lock(chat_id: str, profile_id: str) -> AgentMode:
-    """Lock the selected mode if Chainlit persisted a request before its handler."""
-
-    mode = agent_service.mode_for(chat_id) or AgentMode.READ_ONLY
-    if agent_service.mode_is_locked(chat_id):
-        return mode
-    if not await chainlit_layer.has_user_request(chat_id):
-        return mode
-    mode = agent_service.lock_mode(chat_id)
-    await chainlit_layer.update_thread(
-        chat_id,
-        metadata={
-            "model_profile": profile_id,
-            "agent_mode": mode.value,
-            "agent_mode_locked": True,
-        },
-    )
-    return mode
-
-
 @cl.on_chat_start
 async def on_chat_start():
     chat_id = _thread_id()
-    profile_id = _selected_profile(chat_id)
-    agent_service.set_profile(chat_id, profile_id)
-    cl.user_session.set("model_profile", profile_id)
-    cl.user_session.set("agent_mode", agent_service.mode_for(chat_id).value)
-    await _send_chat_settings()
+    binding = chat_configurations.open(
+        chat_id,
+        cl.user_session.get("chat_profile"),
+    )
+    _remember_chat_configuration(binding)
+    await _send_chat_settings(binding)
 
 
 @cl.on_chat_resume
 async def on_chat_resume(thread):
     chat_id = thread["id"]
-    profile_id = (
-        agent_service.profile_for(chat_id)
-        or thread.get("metadata", {}).get("model_profile")
-        or settings.models[0].id
+    binding = await chat_configurations.recover(
+        chat_id,
+        thread.get("metadata", {}).get("model_profile"),
+        cl.user_session.get("chat_profile"),
     )
-    agent_service.set_profile(chat_id, profile_id)
-    mode = await _recover_mode_lock(chat_id, profile_id)
-    cl.user_session.set("model_profile", profile_id)
-    cl.user_session.set("agent_mode", mode.value)
     if await chainlit_layer.chat_title_state(chat_id) in {
         CHAT_TITLE_PENDING,
         CHAT_TITLE_FALLBACK,
@@ -294,7 +296,7 @@ async def on_chat_resume(thread):
         request_text = await chainlit_layer.first_user_request(chat_id)
         if request_text:
             _start_chat_title(chat_id, request_text)
-    await _send_chat_settings()
+    await _sync_chat_configuration(chat_id, binding, refresh=False)
 
 
 @cl.on_settings_update
@@ -308,19 +310,20 @@ async def on_settings_update(updated):
         else AgentMode.READ_ONLY
     )
     chat_id = _thread_id()
-    profile_id = _selected_profile(chat_id)
-    mode = await _recover_mode_lock(chat_id, profile_id)
-    if agent_service.mode_is_locked(chat_id):
-        cl.user_session.set("agent_mode", mode.value)
-        await _send_chat_settings(refresh=True)
+    profile_hint = cl.user_session.get("chat_profile")
+    binding = await chat_configurations.recover(chat_id, profile_hint)
+    if binding.mode_locked:
+        await _sync_chat_configuration(chat_id, binding, refresh=True)
         return
-    try:
-        mode = agent_service.select_mode(chat_id, requested_mode)
-    except ValueError:
-        mode = agent_service.mode_for(chat_id) or AgentMode.READ_ONLY
-    cl.user_session.set("agent_mode", mode.value)
-    if agent_service.mode_is_locked(chat_id):
-        await _send_chat_settings(refresh=True)
+    binding = chat_configurations.select_mode(
+        chat_id,
+        requested_mode,
+        profile_hint,
+    )
+    if binding.mode_locked:
+        await _sync_chat_configuration(chat_id, binding, refresh=True)
+    else:
+        _remember_chat_configuration(binding)
 
 
 def _changed_file_elements(chat_id: str, names: list[str]):
@@ -337,20 +340,40 @@ def _changed_file_elements(chat_id: str, names: list[str]):
     return elements
 
 
-async def _handle_message(message: cl.Message, chat_id: str) -> None:
-    profile_id = _selected_profile(chat_id)
-    agent_service.set_profile(chat_id, profile_id)
-    mode = agent_service.lock_mode(chat_id)
-    cl.user_session.set("agent_mode", mode.value)
-    await _send_chat_settings(refresh=True)
-    await chainlit_layer.update_thread(
-        chat_id,
-        metadata={
-            "model_profile": profile_id,
-            "agent_mode": mode.value,
-            "agent_mode_locked": True,
-        },
+async def _run_turn(view: ChainlitTurnView, operation: Awaitable[str]) -> str:
+    try:
+        return await operation
+    except asyncio.CancelledError:
+        await asyncio.shield(view.cancel())
+        raise
+    except Exception as error:  # noqa: BLE001 - provider/tool failures end the Turn
+        await view.fail(safe_text(error, max_chars=2000))
+        raise _TurnRunFailed from error
+
+
+async def _complete_turn(
+    view: ChainlitTurnView,
+    chat_id: str,
+    before_files: dict[str, str],
+    answer: str,
+) -> None:
+    after_files = await asyncio.to_thread(sandbox_files.manifest, chat_id)
+    changed_names = [
+        name for name, digest in after_files.items() if before_files.get(name) != digest
+    ]
+    await view.complete(
+        answer,
+        elements=_changed_file_elements(chat_id, changed_names),
+        file_names=changed_names,
     )
+
+
+async def _handle_message(message: cl.Message, chat_id: str) -> None:
+    binding = chat_configurations.accept_message(
+        chat_id,
+        cl.user_session.get("chat_profile"),
+    )
+    await _sync_chat_configuration(chat_id, binding, refresh=True)
 
     is_revision = await runtime.has_turn(message.id)
     is_first_turn = not is_revision and not await runtime_history.has_chat(chat_id)
@@ -375,51 +398,34 @@ async def _handle_message(message: cl.Message, chat_id: str) -> None:
                 chat_id, Path(source), element.name or Path(source).name
             )
 
-    before_files = sandbox_files.manifest(chat_id)
-    if is_revision:
-        await chainlit_layer.wait_for_revision(message.id)
-        await chainlit_layer.truncate_revision(message.id)
+    before_files = await asyncio.to_thread(sandbox_files.manifest, chat_id)
     view = ChainlitTurnView(
         detailed_tools=bool(cl.user_session.get("show_tool_details", False)),
-        tool_title_resolver=lambda name, input_text: agent_service.describe_tool(
+        tool_title_resolver=lambda name, input_text: auxiliary_labels.describe_tool(
             chat_id, name, input_text
         ),
     )
     active_views[chat_id] = view
-    await view.start()
     try:
         if is_revision:
-            answer = await runtime.revise(
-                chat_id, message.id, message.content, view.handle
-            )
+            async with chainlit_layer.revision(message.id):
+                await view.start()
+                answer = await _run_turn(
+                    view,
+                    runtime.revise(chat_id, message.id, message.content, view.handle),
+                )
+                await _complete_turn(view, chat_id, before_files, answer)
         else:
-            answer = await runtime.submit(
-                chat_id, message.id, message.content, view.handle
+            await view.start()
+            answer = await _run_turn(
+                view,
+                runtime.submit(chat_id, message.id, message.content, view.handle),
             )
-    except asyncio.CancelledError:
-        await asyncio.shield(view.cancel())
-        if is_revision:
-            await asyncio.shield(chainlit_layer.restore_revision(message.id))
-        raise
-    except Exception as error:  # noqa: BLE001 - provider/tool failures end the Turn
-        await view.fail(safe_text(error, max_chars=2000))
-        if is_revision:
-            await chainlit_layer.restore_revision(message.id)
+            await _complete_turn(view, chat_id, before_files, answer)
+    except _TurnRunFailed:
         return
     finally:
         active_views.pop(chat_id, None)
-
-    after_files = sandbox_files.manifest(chat_id)
-    changed_names = [
-        name for name, digest in after_files.items() if before_files.get(name) != digest
-    ]
-    await view.complete(
-        answer,
-        elements=_changed_file_elements(chat_id, changed_names),
-        file_names=changed_names,
-    )
-    if is_revision:
-        await chainlit_layer.commit_revision(message.id)
 
 
 @cl.on_message
@@ -436,12 +442,17 @@ async def on_message(message: cl.Message):
 @cl.on_stop
 async def on_stop():
     chat_id = _thread_id()
-    profile_id = agent_service.profile_for(chat_id)
-    if profile_id is not None and chat_id not in deleting_chats:
-        mode = await _recover_mode_lock(chat_id, profile_id)
-        cl.user_session.set("agent_mode", mode.value)
-        if agent_service.mode_is_locked(chat_id):
-            await _send_chat_settings(refresh=True)
+    if chat_id not in deleting_chats:
+        binding = chat_configurations.current(chat_id)
+        if binding is not None:
+            binding = await chat_configurations.recover(
+                chat_id,
+                binding.profile_id,
+            )
+            if binding.mode_locked:
+                await _sync_chat_configuration(chat_id, binding, refresh=True)
+            else:
+                _remember_chat_configuration(binding)
     view = active_views.get(chat_id)
     if view is not None:
         try:
@@ -450,7 +461,7 @@ async def on_stop():
             pass
 
 
-@app.get("/files/{object_key:path}", include_in_schema=False)
+@router.get("/files/{object_key:path}", include_in_schema=False)
 async def local_file(object_key: str):
     try:
         path = storage.path_for(object_key)
@@ -463,6 +474,12 @@ async def local_file(object_key: str):
     )
 
 
+# Chainlit registers its SPA fallback before loading the user module. Keep this
+# specific route ahead of that catch-all so persisted element URLs return bytes.
+_local_file_route = router.routes.pop()
+router.routes.insert(0, _local_file_route)
+
+
 @app.on_event("shutdown")
 async def close_resources() -> None:
     pending_titles = list(chat_title_tasks.values())
@@ -470,4 +487,4 @@ async def close_resources() -> None:
         task.cancel()
     if pending_titles:
         await asyncio.gather(*pending_titles, return_exceptions=True)
-    await agent_service.close()
+    await agent_execution.close()

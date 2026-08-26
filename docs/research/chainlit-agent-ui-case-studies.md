@@ -31,9 +31,9 @@
 
 Этот документ дополняет общий обзор [`chainlit-interactive-ui.md`](./chainlit-interactive-ui.md): здесь внимание сосредоточено на конкретных реализациях и решениях, которые можно перенести в проект.
 
-## Почему текущий интерфейс выглядит «неактивным»
+## Почему исходный интерфейс выглядел «неактивным»
 
-Сейчас [`AgentService.run()`](../../local_agent_chat/agent_service.py) вызывает `graph.ainvoke(...)`, ждёт готовый результат и возвращает строку. [`ChatRuntime`](../../local_agent_chat/runtime.py) также оперирует только готовым `answer`, а [`app.py`](../../app.py) отправляет один `cl.Message` уже после полного завершения Turn.
+На момент исследования UI получал только готовый `answer`. Целевая схема теперь реализована: [`DeepAgentExecution.run()`](../../local_agent_chat/deep_agent_execution.py) переводит native stream в типизированные события, а [`ChainlitTurnView`](../../local_agent_chat/chainlit_ui.py) отображает их без зависимости Agent-кода от Chainlit.
 
 Поэтому UI не получает:
 
@@ -157,7 +157,7 @@ config = RunnableConfig(callbacks=[callback], configurable={...})
 
 ### Вариант B: типизированный event stream — целевая реализация
 
-`AgentService` публикует независимые от Chainlit события, а адаптер в `app.py` переводит их в UI:
+`DeepAgentExecution` публикует независимые от Chainlit события, а `ChainlitTurnView` переводит их в UI:
 
 ```text
 turn_started

@@ -65,8 +65,9 @@ reaction_on_message_received = false
     #    accept = ["image/*", "audio/*", "video/*"]
     # 3. For specific file extensions:
     #    accept = { "application/octet-stream" = [".xyz", ".pdb"] }
-    # Note: Using "*/*" is not recommended as it may cause browser warnings
-    accept = ["*/*"]
+    # An empty list renders an unrestricted browser picker without invalid
+    # wildcard MIME patterns. The server compatibility adapter treats it as all files.
+    accept = []
     max_files = 20
     max_size_mb = 100
 

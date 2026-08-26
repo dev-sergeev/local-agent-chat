@@ -15,9 +15,9 @@ from chainlit.emitter import BaseChainlitEmitter
 from chainlit.server import sio
 from chainlit.session import HTTPSession, WebsocketSession
 from chainlit.user import User
+from langchain import chat_models as langchain_chat_models
 from langchain_core.messages import AIMessage
 
-from local_agent_chat import agent_service as agent_service_module
 from local_agent_chat.agent_events import EventSink
 from local_agent_chat.chat_titles import (
     CHAT_TITLE_GENERATED,
@@ -88,7 +88,7 @@ async def test_transient_chat_title_failure_retries_on_next_turn(
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     title_model = TransientTitleModel()
     monkeypatch.setattr(
-        agent_service_module,
+        langchain_chat_models,
         "init_chat_model",
         lambda *_args, **_kwargs: title_model,
     )
@@ -142,8 +142,10 @@ async def test_transient_chat_title_failure_retries_on_next_turn(
         await chat_app.on_settings_update(
             {"extended_mode": True, "show_tool_details": False}
         )
-        assert chat_app.agent_service.mode_for("chat-1").value == "extended"
-        assert chat_app.agent_service.mode_is_locked("chat-1") is False
+        binding = chat_app.chat_bindings.get("chat-1")
+        assert binding is not None
+        assert binding.mode.value == "extended"
+        assert binding.mode_locked is False
 
         await layer.update_thread("chat-1", name=first_request, user_id=user.id)
         first = cl.Message(id="turn-1", content=first_request, type="user_message")
@@ -160,7 +162,9 @@ async def test_transient_chat_title_failure_retries_on_next_turn(
         await chat_app.on_settings_update(
             {"extended_mode": False, "show_tool_details": False}
         )
-        assert chat_app.agent_service.mode_for("chat-1").value == "extended"
+        binding = chat_app.chat_bindings.get("chat-1")
+        assert binding is not None
+        assert binding.mode.value == "extended"
 
         second = cl.Message(id="turn-2", content="Продолжай", type="user_message")
         await layer.create_step(second.to_dict())
@@ -187,7 +191,7 @@ async def test_transient_chat_title_failure_retries_on_next_turn(
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
-        await chat_app.agent_service.close()
+        await chat_app.agent_execution.close()
         await layer.close()
         sys.modules.pop(module_name, None)
 
@@ -238,7 +242,9 @@ async def test_persisted_first_message_locks_mode_at_next_ui_entrypoint(
         )
         first = cl.Message(id="turn-resumed", content=request, type="user_message")
         await layer.create_step(first.to_dict())
-        assert chat_app.agent_service.mode_is_locked("chat-resumed") is False
+        binding = chat_app.chat_bindings.get("chat-resumed")
+        assert binding is not None
+        assert binding.mode_locked is False
 
         if recovery_entrypoint == "resume":
             await chat_app.on_chat_resume(
@@ -258,15 +264,17 @@ async def test_persisted_first_message_locks_mode_at_next_ui_entrypoint(
         )
         assert resumed_mode["initial"] is True
         assert resumed_mode["disabled"] is True
-        assert chat_app.agent_service.mode_for("chat-resumed").value == "extended"
-        assert chat_app.agent_service.mode_is_locked("chat-resumed") is True
+        binding = chat_app.chat_bindings.get("chat-resumed")
+        assert binding is not None
+        assert binding.mode.value == "extended"
+        assert binding.mode_locked is True
         resumed_thread = await layer.get_thread("chat-resumed")
         assert resumed_thread is not None
         assert resumed_thread["metadata"]["agent_mode"] == "extended"
         assert resumed_thread["metadata"]["agent_mode_locked"] is True
         assert resumed_thread["metadata"][CHAT_TITLE_STATE_KEY] == CHAT_TITLE_GENERATED
     finally:
-        await chat_app.agent_service.close()
+        await chat_app.agent_execution.close()
         await layer.close()
         sys.modules.pop(module_name, None)
 
@@ -367,8 +375,10 @@ async def test_socket_acceptance_locks_mode_before_background_message_processing
         await asyncio.sleep(0)
         await asyncio.wait_for(processing_started.wait(), timeout=1)
 
-        assert chat_app.agent_service.mode_for(chat_id).value == expected_mode
-        assert chat_app.agent_service.mode_is_locked(chat_id) is True
+        binding = chat_app.chat_bindings.get(chat_id)
+        assert binding is not None
+        assert binding.mode.value == expected_mode
+        assert binding.mode_locked is True
         assert await chat_app.chainlit_layer.has_user_request(chat_id) is False
         assert len(background_tasks) == len(ordered_events) + 1
         assert all(not task.done() for task in background_tasks)
@@ -376,6 +386,6 @@ async def test_socket_acceptance_locks_mode_before_background_message_processing
         release_processing.set()
         await asyncio.gather(*background_tasks, return_exceptions=True)
         await session.delete()
-        await chat_app.agent_service.close()
+        await chat_app.agent_execution.close()
         await chat_app.chainlit_layer.close()
         sys.modules.pop(module_name, None)

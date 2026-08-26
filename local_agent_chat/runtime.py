@@ -35,7 +35,6 @@ class History(Protocol):
     async def append(self, turn: Turn) -> None: ...
     async def replace_from(self, turn_id: str, turn: Turn) -> None: ...
     async def get(self, turn_id: str) -> Turn: ...
-    async def set_answer(self, turn_id: str, answer: str) -> None: ...
 
 
 class ChatRuntime:
@@ -56,8 +55,16 @@ class ChatRuntime:
 
     async def _restore_state(self, chat_id: str, memory: str, files: str) -> None:
         async def restore() -> None:
-            await self._agent.restore(chat_id, memory)
-            await self._sandbox.restore(chat_id, files)
+            results = await asyncio.gather(
+                self._agent.restore(chat_id, memory),
+                self._sandbox.restore(chat_id, files),
+                return_exceptions=True,
+            )
+            errors = [result for result in results if isinstance(result, BaseException)]
+            if len(errors) == 1:
+                raise errors[0]
+            if errors:
+                raise BaseExceptionGroup("Failed to restore Chat state", errors)
 
         await asyncio.shield(restore())
 
@@ -75,12 +82,12 @@ class ChatRuntime:
             files = await self._sandbox.snapshot(chat_id)
             try:
                 answer = await self._agent.run(chat_id, text, emit)
+                await self._history.append(
+                    Turn(turn_id, chat_id, text, answer, memory, files)
+                )
             except (Exception, asyncio.CancelledError):
                 await self._restore_state(chat_id, memory, files)
                 raise
-            await self._history.append(
-                Turn(turn_id, chat_id, text, answer, memory, files)
-            )
             return answer
 
     async def has_turn(self, turn_id: str) -> bool:
@@ -110,18 +117,18 @@ class ChatRuntime:
                 await self._agent.restore(chat_id, original.memory_checkpoint)
                 await self._sandbox.restore(chat_id, original.sandbox_snapshot)
                 answer = await self._agent.run(chat_id, text, emit)
+                replacement = Turn(
+                    turn_id,
+                    chat_id,
+                    text,
+                    answer,
+                    original.memory_checkpoint,
+                    original.sandbox_snapshot,
+                )
+                await self._history.replace_from(turn_id, replacement)
             except (Exception, asyncio.CancelledError):
                 await self._restore_state(chat_id, rollback_memory, rollback_files)
                 raise
-            replacement = Turn(
-                turn_id,
-                chat_id,
-                text,
-                answer,
-                original.memory_checkpoint,
-                original.sandbox_snapshot,
-            )
-            await self._history.replace_from(turn_id, replacement)
             return answer
 
     async def delete_chat(

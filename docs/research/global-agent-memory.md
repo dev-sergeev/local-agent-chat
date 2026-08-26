@@ -21,7 +21,7 @@
 
 Сейчас приложение уже имеет корректную **short-term, thread-scoped memory**:
 
-- `AgentService` компилирует Deep Agent с `AsyncSqliteSaver`; `thread_id` равен идентификатору Chainlit Chat. [`agent_service.py`](../../local_agent_chat/agent_service.py)
+- `DeepAgentExecution` компилирует Deep Agent с `AsyncSqliteSaver`; `thread_id` равен идентификатору Chainlit Chat. [`deep_agent_execution.py`](../../local_agent_chat/deep_agent_execution.py)
 - checkpoint используется для продолжения конкретного Chat, отмены и Revision. [`runtime.py`](../../local_agent_chat/runtime.py)
 - `runtime-history.sqlite3` содержит канонические активные `turns`, а заменённая Revision ветка переносится в `superseded_turns`. [`sqlite_history.py`](../../local_agent_chat/sqlite_history.py)
 - Chat history для UI хранится отдельно в `chainlit.sqlite3`; эта плоскость включает Steps и элементы, поэтому она хуже подходит как канонический корпус для agent retrieval. [`chainlit_data.py`](../../local_agent_chat/chainlit_data.py)
@@ -171,7 +171,7 @@ active Turn ─► consolidator ─► structured memories + source links
 1. `SQLiteHistory` остаётся владельцем active/superseded lifecycle.
 2. Новый adapter уровня domain, условно `GlobalChatMemory`, предоставляет search/read и не раскрывает SQL модели.
 3. Оба режима Agent получают одинаковые read-only history tools. Расширенный режим не получает инструментов удаления/редактирования самой истории.
-4. `AgentService` передаёт инструментам внутренний current `chat_id`; модель задаёт только query и bounded pagination.
+4. `DeepAgentExecution` передаёт инструментам внутренний current `chat_id`; модель задаёт только query и bounded pagination.
 5. Существующий per-Chat `LocalSandboxManager` не следует превращать в глобальный memory backend. Sandbox lifecycle и глобальная history имеют разные ownership/deletion rules.
 
 Deep Agents технически позволяет передать `store=` в `create_deep_agent`, использовать `StoreBackend` для persistent cross-thread files и `CompositeBackend` для разделения thread scratch и `/memories/`. [Deep Agents Backends](https://docs.langchain.com/oss/python/deepagents/backends), [`create_deep_agent` reference](https://reference.langchain.com/python/deepagents/graph/create_deep_agent). Но для требования «поиск прошлых Chat» explicit tools поверх существующего журнала проще и сохраняют текущую Sandbox-модель. `StoreBackend` лучше оставить для отдельной semantic/profile memory в следующем этапе.

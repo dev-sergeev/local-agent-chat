@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 from chainlit.data.storage_clients.base import BaseStorageClient
 from chainlit.data.utils import queue_until_user_message
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from .chat_titles import (
     CHAT_TITLE_FALLBACK,
@@ -18,6 +23,8 @@ from .chat_titles import (
     DEFAULT_CHAT_TITLE,
 )
 from .tool_logs import format_tool_log
+
+logger = logging.getLogger(__name__)
 
 STEP_COLUMNS = [
     "id",
@@ -43,6 +50,28 @@ STEP_COLUMNS = [
     "defaultOpen",
     "autoCollapse",
 ]
+
+ELEMENT_COLUMNS = [
+    "id",
+    "threadId",
+    "type",
+    "chainlitKey",
+    "url",
+    "objectKey",
+    "name",
+    "display",
+    "size",
+    "language",
+    "page",
+    "autoPlay",
+    "playerConfig",
+    "forId",
+    "mime",
+    "props",
+]
+
+FEEDBACK_COLUMNS = ["id", "forId", "value", "comment"]
+REVISION_ARCHIVE_VERSION = 2
 
 
 class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
@@ -229,100 +258,366 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
 
     async def update_step(self, step_dict):
         async with self._step_lock(step_dict["id"]):
+            await self.update_thread(step_dict["threadId"])
             existing = await self.get_step(step_dict["id"])
-            if (
-                existing
-                and existing.get("type") == "user_message"
-                and existing.get("output") != step_dict.get("output")
-            ):
-                await self.execute_sql(
-                    query='DELETE FROM step_revisions WHERE "rootId" = :root_id',
-                    parameters={"root_id": step_dict["id"]},
-                )
-                names = ", ".join(f'"{name}"' for name in STEP_COLUMNS)
-                selected = ", ".join(f's."{name}"' for name in STEP_COLUMNS)
-                await self.execute_sql(
-                    query=f"""INSERT INTO step_revisions
-                        ("rootId", {names}, "archivedAt")
-                        SELECT :root_id, {selected}, CURRENT_TIMESTAMP FROM steps s
-                        WHERE s."threadId" = :thread_id
-                            AND s."createdAt" >= :created_at""",
-                    parameters={
-                        "root_id": step_dict["id"],
-                        "thread_id": existing["threadId"],
-                        "created_at": existing["createdAt"],
-                    },
-                )
-            await SQLAlchemyDataLayer.create_step.__wrapped__(self, step_dict)
+            async with self.async_session() as session:
+                async with session.begin():
+                    if (
+                        existing
+                        and existing.get("type") == "user_message"
+                        and existing.get("output") != step_dict.get("output")
+                    ):
+                        await self._stage_revision(session, step_dict["id"], existing)
+                    await self._upsert_step(session, step_dict)
 
-    async def wait_for_revision(self, root_id: str, timeout: float = 2.0) -> None:
-        """Wait for Chainlit's background update task to stage the UI branch."""
+    @staticmethod
+    async def _upsert_step(session: AsyncSession, step_dict: dict) -> None:
+        record = dict(step_dict)
+        record["showInput"] = (
+            str(record.get("showInput", "")).lower() if "showInput" in record else None
+        )
+        parameters = {
+            key: value
+            for key, value in record.items()
+            if value is not None and not (isinstance(value, dict) and not value)
+        }
+        parameters["metadata"] = json.dumps(record.get("metadata", {}))
+        parameters["generation"] = json.dumps(record.get("generation", {}))
+        columns = ", ".join(f'"{key}"' for key in parameters)
+        values = ", ".join(f":{key}" for key in parameters)
+        updates = ", ".join(f'"{key}" = :{key}' for key in parameters if key != "id")
+        await session.execute(
+            text(
+                f"""INSERT INTO steps ({columns})
+                    VALUES ({values})
+                    ON CONFLICT (id) DO UPDATE SET {updates}"""
+            ),
+            parameters,
+        )
+
+    @staticmethod
+    async def _stage_revision(
+        session: AsyncSession, root_id: str, existing: dict
+    ) -> None:
+        staged = await session.execute(
+            text('SELECT 1 FROM step_revisions WHERE "rootId" = :root_id LIMIT 1'),
+            {"root_id": root_id},
+        )
+        if staged.first() is not None:
+            return
+
+        parameters = {
+            "root_id": root_id,
+            "thread_id": existing["threadId"],
+            "created_at": existing["createdAt"],
+            "archive_version": REVISION_ARCHIVE_VERSION,
+        }
+        step_names = ", ".join(f'"{name}"' for name in STEP_COLUMNS)
+        selected_steps = ", ".join(f's."{name}"' for name in STEP_COLUMNS)
+        await session.execute(
+            text(
+                f"""INSERT INTO step_revisions
+                    ("rootId", {step_names}, "archivedAt", "archiveVersion")
+                    SELECT :root_id, {selected_steps}, CURRENT_TIMESTAMP,
+                           :archive_version
+                    FROM steps s
+                    WHERE s."threadId" = :thread_id
+                      AND s."createdAt" >= :created_at"""
+            ),
+            parameters,
+        )
+
+        element_names = ", ".join(f'"{name}"' for name in ELEMENT_COLUMNS)
+        selected_elements = ", ".join(f'e."{name}"' for name in ELEMENT_COLUMNS)
+        await session.execute(
+            text(
+                f"""INSERT INTO element_revisions
+                    ("rootId", {element_names}, "archivedAt")
+                    SELECT :root_id, {selected_elements}, CURRENT_TIMESTAMP
+                    FROM elements e
+                    WHERE e."forId" IN (
+                        SELECT id FROM step_revisions
+                        WHERE "rootId" = :root_id
+                    )"""
+            ),
+            parameters,
+        )
+
+        feedback_names = ", ".join(f'"{name}"' for name in FEEDBACK_COLUMNS)
+        selected_feedback = ", ".join(f'f."{name}"' for name in FEEDBACK_COLUMNS)
+        await session.execute(
+            text(
+                f"""INSERT INTO feedback_revisions
+                    ("rootId", {feedback_names}, "archivedAt")
+                    SELECT :root_id, {selected_feedback}, CURRENT_TIMESTAMP
+                    FROM feedbacks f
+                    WHERE f."forId" IN (
+                        SELECT id FROM step_revisions
+                        WHERE "rootId" = :root_id
+                    )"""
+            ),
+            parameters,
+        )
+
+    @asynccontextmanager
+    async def revision(self, root_id: str) -> AsyncIterator[None]:
+        """Replace one persisted UI continuation or restore it on interruption."""
+
+        await self._wait_for_revision(root_id)
+        try:
+            await self._truncate_revision(root_id)
+            yield
+        except BaseException:
+            await asyncio.shield(self._restore_revision(root_id))
+            raise
+        try:
+            await self._commit_revision(root_id)
+        except BaseException:
+            await asyncio.shield(self._restore_revision(root_id))
+            raise
+
+    async def _wait_for_revision(self, root_id: str, timeout: float = 2.0) -> None:
+        """Wait for Chainlit to stage the superseded UI continuation."""
 
         deadline = asyncio.get_running_loop().time() + timeout
         while asyncio.get_running_loop().time() < deadline:
-            rows = await self.execute_sql(
-                query='SELECT 1 FROM step_revisions WHERE "rootId" = :root_id LIMIT 1',
-                parameters={"root_id": root_id},
-            )
-            if isinstance(rows, list) and rows:
+            async with self.async_session() as session:
+                staged = await session.execute(
+                    text(
+                        'SELECT 1 FROM step_revisions WHERE "rootId" = :root_id LIMIT 1'
+                    ),
+                    {"root_id": root_id},
+                )
+            if staged.first() is not None:
                 return
             await asyncio.sleep(0.01)
-        raise RuntimeError("Timed out while staging the edited UI branch")
+        raise RuntimeError("Timed out while staging the edited UI continuation")
 
-    async def truncate_revision(self, root_id: str) -> None:
-        """Keep the edited user step and remove every superseded descendant."""
-
-        root = await self.get_step(root_id)
+    @staticmethod
+    async def _revision_root(session: AsyncSession, root_id: str):
+        result = await session.execute(
+            text(
+                """SELECT "threadId", "createdAt", "archiveVersion"
+                   FROM step_revisions
+                   WHERE "rootId" = :root_id AND id = :root_id"""
+            ),
+            {"root_id": root_id},
+        )
+        root = result.mappings().first()
         if root is None:
             raise KeyError(root_id)
-        parameters = {
-            "thread_id": root["threadId"],
-            "created_at": root["createdAt"],
-        }
-        descendant_ids = """SELECT id FROM steps
-            WHERE "threadId" = :thread_id AND "createdAt" > :created_at"""
-        await self.execute_sql(
-            query=f'DELETE FROM feedbacks WHERE "forId" IN ({descendant_ids})',
-            parameters=parameters,
-        )
-        await self.execute_sql(
-            query=f'DELETE FROM elements WHERE "forId" IN ({descendant_ids})',
-            parameters=parameters,
-        )
-        await self.execute_sql(
-            query='DELETE FROM steps WHERE "threadId" = :thread_id AND "createdAt" > :created_at',
-            parameters=parameters,
-        )
+        return root
 
-    async def commit_revision(self, root_id: str) -> None:
-        await self.execute_sql(
-            query='DELETE FROM step_revisions WHERE "rootId" = :root_id',
-            parameters={"root_id": root_id},
-        )
+    async def _truncate_revision(self, root_id: str) -> None:
+        """Keep the edited user step and remove every superseded descendant."""
 
-    async def restore_revision(self, root_id: str) -> None:
-        rows = await self.execute_sql(
-            query='SELECT * FROM step_revisions WHERE "rootId" = :root_id ORDER BY "createdAt"',
-            parameters={"root_id": root_id},
-        )
-        if not isinstance(rows, list) or not rows:
+        async with self.async_session() as session:
+            async with session.begin():
+                root = await self._revision_root(session, root_id)
+                parameters = {
+                    "thread_id": root["threadId"],
+                    "created_at": root["createdAt"],
+                }
+                descendant_ids = """SELECT id FROM steps
+                    WHERE "threadId" = :thread_id
+                      AND "createdAt" > :created_at"""
+                await session.execute(
+                    text(f'DELETE FROM feedbacks WHERE "forId" IN ({descendant_ids})'),
+                    parameters,
+                )
+                await session.execute(
+                    text(f'DELETE FROM elements WHERE "forId" IN ({descendant_ids})'),
+                    parameters,
+                )
+                await session.execute(
+                    text(
+                        'DELETE FROM steps WHERE "threadId" = :thread_id '
+                        'AND "createdAt" > :created_at'
+                    ),
+                    parameters,
+                )
+
+    async def _commit_revision(self, root_id: str) -> None:
+        object_keys: set[str] = set()
+        async with self.async_session() as session:
+            async with session.begin():
+                stored_keys = await session.execute(
+                    text(
+                        'SELECT DISTINCT "objectKey" FROM element_revisions '
+                        'WHERE "rootId" = :root_id AND "objectKey" IS NOT NULL'
+                    ),
+                    {"root_id": root_id},
+                )
+                object_keys = {str(row[0]) for row in stored_keys}
+                await session.execute(
+                    text('DELETE FROM feedback_revisions WHERE "rootId" = :root_id'),
+                    {"root_id": root_id},
+                )
+                await session.execute(
+                    text('DELETE FROM element_revisions WHERE "rootId" = :root_id'),
+                    {"root_id": root_id},
+                )
+                await session.execute(
+                    text('DELETE FROM step_revisions WHERE "rootId" = :root_id'),
+                    {"root_id": root_id},
+                )
+        await self._delete_unreferenced_blobs(object_keys)
+
+    async def _restore_revision(self, root_id: str) -> None:
+        object_keys: set[str] = set()
+        async with self.async_session() as session:
+            async with session.begin():
+                stored_steps = await session.execute(
+                    text(
+                        """SELECT * FROM step_revisions
+                           WHERE "rootId" = :root_id
+                           ORDER BY "createdAt", id"""
+                    ),
+                    {"root_id": root_id},
+                )
+                step_rows = list(stored_steps.mappings())
+                if not step_rows:
+                    return
+                root = next(
+                    (row for row in step_rows if row["id"] == root_id), step_rows[0]
+                )
+                version = int(root.get("archiveVersion") or 1)
+                parameters = {
+                    "thread_id": root["threadId"],
+                    "created_at": root["createdAt"],
+                    "root_id": root_id,
+                }
+                continuation_ids = """SELECT id FROM steps
+                    WHERE "threadId" = :thread_id
+                      AND "createdAt" >= :created_at"""
+
+                element_rows = []
+                feedback_rows = []
+                if version >= REVISION_ARCHIVE_VERSION:
+                    current_keys = await session.execute(
+                        text(
+                            f"""SELECT DISTINCT "objectKey" FROM elements
+                                WHERE "forId" IN ({continuation_ids})
+                                  AND "objectKey" IS NOT NULL"""
+                        ),
+                        parameters,
+                    )
+                    object_keys = {str(row[0]) for row in current_keys}
+                    stored_elements = await session.execute(
+                        text(
+                            """SELECT * FROM element_revisions
+                               WHERE "rootId" = :root_id ORDER BY id"""
+                        ),
+                        parameters,
+                    )
+                    element_rows = list(stored_elements.mappings())
+                    stored_feedback = await session.execute(
+                        text(
+                            """SELECT * FROM feedback_revisions
+                               WHERE "rootId" = :root_id ORDER BY id"""
+                        ),
+                        parameters,
+                    )
+                    feedback_rows = list(stored_feedback.mappings())
+                    await session.execute(
+                        text(
+                            f"DELETE FROM feedbacks "
+                            f'WHERE "forId" IN ({continuation_ids})'
+                        ),
+                        parameters,
+                    )
+                    await session.execute(
+                        text(
+                            f"DELETE FROM elements "
+                            f'WHERE "forId" IN ({continuation_ids})'
+                        ),
+                        parameters,
+                    )
+
+                await session.execute(
+                    text(
+                        'DELETE FROM steps WHERE "threadId" = :thread_id '
+                        'AND "createdAt" >= :created_at'
+                    ),
+                    parameters,
+                )
+                await self._insert_archived_rows(
+                    session,
+                    "steps",
+                    STEP_COLUMNS,
+                    step_rows,
+                    replace=version < REVISION_ARCHIVE_VERSION,
+                )
+                if version >= REVISION_ARCHIVE_VERSION:
+                    await self._insert_archived_rows(
+                        session, "elements", ELEMENT_COLUMNS, element_rows
+                    )
+                    await self._insert_archived_rows(
+                        session, "feedbacks", FEEDBACK_COLUMNS, feedback_rows
+                    )
+                    await session.execute(
+                        text(
+                            'DELETE FROM feedback_revisions WHERE "rootId" = :root_id'
+                        ),
+                        parameters,
+                    )
+                    await session.execute(
+                        text('DELETE FROM element_revisions WHERE "rootId" = :root_id'),
+                        parameters,
+                    )
+                await session.execute(
+                    text('DELETE FROM step_revisions WHERE "rootId" = :root_id'),
+                    parameters,
+                )
+        await self._delete_unreferenced_blobs(object_keys)
+
+    @staticmethod
+    async def _insert_archived_rows(
+        session: AsyncSession,
+        table: str,
+        columns: list[str],
+        rows: list,
+        *,
+        replace: bool = False,
+    ) -> None:
+        if not rows:
             return
-        first = rows[0]
-        await self.execute_sql(
-            query='DELETE FROM steps WHERE "threadId" = :thread_id AND "createdAt" >= :created_at',
-            parameters={
-                "thread_id": first["threadId"],
-                "created_at": first["createdAt"],
-            },
+        names = ", ".join(f'"{name}"' for name in columns)
+        values = ", ".join(f":{name}" for name in columns)
+        operation = "INSERT OR REPLACE" if replace else "INSERT"
+        await session.execute(
+            text(f"{operation} INTO {table} ({names}) VALUES ({values})"),
+            [{name: row.get(name) for name in columns} for row in rows],
         )
-        for row in rows:
-            names = ",".join(f'"{name}"' for name in STEP_COLUMNS)
-            values = ",".join(f":{name}" for name in STEP_COLUMNS)
-            await self.execute_sql(
-                query=f"INSERT OR REPLACE INTO steps ({names}) VALUES ({values})",
-                parameters={name: row.get(name) for name in STEP_COLUMNS},
-            )
-        await self.commit_revision(root_id)
+
+    async def _delete_unreferenced_blobs(self, object_keys: set[str]) -> None:
+        if self.storage_provider is None:
+            return
+        for object_key in sorted(object_keys):
+            try:
+                async with self.async_session() as session:
+                    referenced = await session.execute(
+                        text(
+                            'SELECT 1 FROM elements WHERE "objectKey" = :object_key '
+                            "LIMIT 1"
+                        ),
+                        {"object_key": object_key},
+                    )
+                if referenced.first() is None:
+                    await self.storage_provider.delete_file(object_key)
+            except asyncio.CancelledError:
+                # The database decision is already committed. Keep the Turn
+                # authoritative even if best-effort blob cleanup is interrupted.
+                logger.warning(
+                    "Revision blob cleanup was interrupted for %s", object_key
+                )
+                return
+            except Exception:  # noqa: BLE001 - blob cleanup is post-decision
+                logger.warning(
+                    "Failed to delete an unreferenced Revision blob %s",
+                    object_key,
+                    exc_info=True,
+                )
 
     async def delete_thread(self, thread_id: str):
         if self.chat_cleanup is not None:
@@ -365,7 +660,24 @@ CREATE TABLE IF NOT EXISTS step_revisions (
  streaming INTEGER, "waitForAnswer" INTEGER, "isError" INTEGER, metadata TEXT, tags TEXT,
  input TEXT, output TEXT, "createdAt" TEXT, start TEXT, end TEXT, generation TEXT, "showInput" TEXT,
  language TEXT, command TEXT, modes TEXT, "defaultOpen" INTEGER DEFAULT 0,
- "autoCollapse" INTEGER DEFAULT 0, "archivedAt" TEXT NOT NULL
+ "autoCollapse" INTEGER DEFAULT 0, "archivedAt" TEXT NOT NULL,
+ "archiveVersion" INTEGER NOT NULL DEFAULT 2
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_step_revisions_root_id
+ON step_revisions("rootId", id);
+CREATE TABLE IF NOT EXISTS element_revisions (
+ "rootId" TEXT NOT NULL,
+ id TEXT NOT NULL, "threadId" TEXT, type TEXT NOT NULL, "chainlitKey" TEXT, url TEXT,
+ "objectKey" TEXT, name TEXT NOT NULL, display TEXT, size INTEGER, language TEXT, page INTEGER,
+ "autoPlay" INTEGER, "playerConfig" TEXT, "forId" TEXT, mime TEXT,
+ props TEXT NOT NULL DEFAULT '{}', "archivedAt" TEXT NOT NULL,
+ PRIMARY KEY("rootId", id)
+);
+CREATE TABLE IF NOT EXISTS feedback_revisions (
+ "rootId" TEXT NOT NULL,
+ id TEXT NOT NULL, "forId" TEXT NOT NULL, value REAL, comment TEXT,
+ "archivedAt" TEXT NOT NULL,
+ PRIMARY KEY("rootId", id)
 );
 """
 
@@ -380,11 +692,23 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
                 connection.execute(
                     f'ALTER TABLE "{table}" ADD COLUMN "{column}" INTEGER DEFAULT 0'
                 )
+    revision_columns = {
+        row[1] for row in connection.execute('PRAGMA table_info("step_revisions")')
+    }
+    if "archiveVersion" not in revision_columns:
+        connection.execute(
+            'ALTER TABLE "step_revisions" '
+            'ADD COLUMN "archiveVersion" INTEGER NOT NULL DEFAULT 1'
+        )
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_step_revisions_root_id "
+        'ON step_revisions("rootId", id)'
+    )
 
 
 def create_chainlit_data_layer(
     path: Path, storage: BaseStorageClient | None = None
-) -> SQLAlchemyDataLayer:
+) -> SQLiteChainlitDataLayer:
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as connection:
         connection.executescript(SCHEMA)

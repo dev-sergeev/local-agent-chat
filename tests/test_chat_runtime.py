@@ -52,18 +52,6 @@ class InMemoryHistory:
     async def get(self, turn_id: str) -> Turn:
         return next(item for item in self.turns if item.id == turn_id)
 
-    async def set_answer(self, turn_id: str, answer: str) -> None:
-        index = next(i for i, item in enumerate(self.turns) if item.id == turn_id)
-        current = self.turns[index]
-        self.turns[index] = Turn(
-            current.id,
-            current.chat_id,
-            current.text,
-            answer,
-            current.memory_checkpoint,
-            current.sandbox_snapshot,
-        )
-
 
 class ChatRuntimeTest(unittest.IsolatedAsyncioTestCase):
     async def test_concurrent_turn_for_same_chat_is_rejected(self) -> None:
@@ -132,6 +120,58 @@ class ChatRuntimeTest(unittest.IsolatedAsyncioTestCase):
             ("original", "answer:original"),
         )
 
+    async def test_submit_rolls_back_when_history_persistence_fails(self) -> None:
+        agent = RecordingAgent()
+
+        class FailingHistory(InMemoryHistory):
+            async def append(self, turn: Turn) -> None:
+                del turn
+                raise RuntimeError("history unavailable")
+
+        history = FailingHistory(agent.events)
+        runtime = ChatRuntime(
+            agent=agent, sandbox=RecordingSandbox(agent.events), history=history
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "history unavailable"):
+            await runtime.submit("chat-1", "turn-1", "request")
+
+        self.assertEqual(history.turns, [])
+        self.assertEqual(
+            agent.events[-2:],
+            [
+                ("restore-memory", "memory-before-first"),
+                ("restore-sandbox", "files-before-first"),
+            ],
+        )
+
+    async def test_revision_rolls_back_when_history_replacement_fails(self) -> None:
+        agent = RecordingAgent()
+
+        class FailingHistory(InMemoryHistory):
+            async def replace_from(self, turn_id: str, turn: Turn) -> None:
+                del turn_id, turn
+                raise RuntimeError("history unavailable")
+
+        history = FailingHistory(agent.events)
+        runtime = ChatRuntime(
+            agent=agent, sandbox=RecordingSandbox(agent.events), history=history
+        )
+        await runtime.submit("chat-1", "turn-1", "original")
+        agent.events.clear()
+
+        with self.assertRaisesRegex(RuntimeError, "history unavailable"):
+            await runtime.revise("chat-1", "turn-1", "revised")
+
+        self.assertEqual(history.turns[0].text, "original")
+        self.assertEqual(
+            agent.events[-2:],
+            [
+                ("restore-memory", "memory-before-first"),
+                ("restore-sandbox", "files-before-first"),
+            ],
+        )
+
     async def test_submit_forwards_events_and_rolls_back_cancelled_turn(self) -> None:
         agent = RecordingAgent()
         history = InMemoryHistory(agent.events)
@@ -154,6 +194,35 @@ class ChatRuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(seen, [TextDelta("partial")])
         self.assertEqual(history.turns, [])
+        self.assertEqual(
+            agent.events,
+            [
+                ("restore-memory", "memory-before-first"),
+                ("restore-sandbox", "files-before-first"),
+            ],
+        )
+
+    async def test_rollback_attempts_both_restores_when_one_fails(self) -> None:
+        agent = RecordingAgent()
+        history = InMemoryHistory(agent.events)
+        sandbox = RecordingSandbox(agent.events)
+        runtime = ChatRuntime(agent=agent, sandbox=sandbox, history=history)
+
+        async def fail_run(
+            chat_id: str, text: str, emit: EventSink | None = None
+        ) -> str:
+            raise RuntimeError("model failed")
+
+        async def fail_memory_restore(chat_id: str, checkpoint: str) -> None:
+            agent.events.append(("restore-memory", checkpoint))
+            raise RuntimeError("memory restore failed")
+
+        agent.run = fail_run  # type: ignore[method-assign]
+        agent.restore = fail_memory_restore  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(RuntimeError, "memory restore failed"):
+            await runtime.submit("chat-1", "turn-1", "request")
+
         self.assertEqual(
             agent.events,
             [

@@ -40,6 +40,22 @@ def test_tool_display_uses_human_labels_and_short_context() -> None:
     assert read.input == '{\n  "file_path": "src/agent.py"\n}'
 
 
+def test_tool_display_keeps_long_file_paths_distinguishable() -> None:
+    common = (
+        "/home/jovyan/work/web-ui/.local-agent-chat/sandboxes/"
+        "c7dd89f4-d728-4c49-a324-948b91c3dbe5/files"
+    )
+
+    readme = tool_display("read_file", f'{{"file_path": "{common}/README.md"}}')
+    empty = tool_display(
+        "read_file", f'{{"file_path": "{common}/.ui-empty-upload.py"}}'
+    )
+
+    assert readme.title.endswith("/README.md")
+    assert empty.title.endswith("/.ui-empty-upload.py")
+    assert readme.title != empty.title
+
+
 def test_tool_display_names_global_memory_actions() -> None:
     search = tool_display(
         "search_past_chats", '{"query":"решение по глобальной памяти"}'
