@@ -1,269 +1,50 @@
 import sqlite3
 from dataclasses import FrozenInstanceError
-from pathlib import Path
 
 import pytest
 
-from local_agent_chat.agent_modes import AgentMode
-from local_agent_chat.chat_bindings import ChatBinding, ChatBindings
+from local_agent_chat.chat_bindings import ChatBindings
 
 
-def test_binding_is_an_immutable_slots_value(tmp_path: Path) -> None:
-    bindings = ChatBindings(tmp_path / "bindings.sqlite3", ("local",))
-
-    binding = bindings.open("chat-1", "local")
-
-    assert not hasattr(binding, "__dict__")
+def test_profile_selection_is_persisted_and_immutable(tmp_path):
+    path = tmp_path / "state.sqlite3"
+    bindings = ChatBindings(path, ["one", "two"])
+    chosen = bindings.open("chat", "two")
+    assert chosen.profile_id == "two"
     with pytest.raises(FrozenInstanceError):
-        binding.mode_locked = True  # type: ignore[misc]
+        chosen.profile_id = "one"
+    assert bindings.open("chat", "one").profile_id == "two"
+    assert ChatBindings(path, ["one", "two"]).get("chat") == chosen
 
 
-def test_binding_lifecycle_survives_restart(tmp_path: Path) -> None:
-    database = tmp_path / "bindings.sqlite3"
-    bindings = ChatBindings(database, ("local",))
-    assert bindings.get("chat-1") is None
-
-    opened = bindings.open("chat-1", "local")
-    selected = bindings.select_mode("chat-1", AgentMode.HOST_FILES)
-    locked = bindings.lock("chat-1")
-    renewed = bindings.new_memory_thread("chat-1")
-
-    assert opened == ChatBinding("local", AgentMode.CHAT_FILES, False, "chat-1")
-    assert selected == ChatBinding("local", AgentMode.HOST_FILES, False, "chat-1")
-    assert locked == ChatBinding("local", AgentMode.HOST_FILES, True, "chat-1")
-    assert renewed.profile_id == "local"
-    assert renewed.mode is AgentMode.HOST_FILES
-    assert renewed.mode_locked is True
-    assert renewed.memory_thread_id.startswith("chat-1:")
-    assert len(renewed.memory_thread_id) == len("chat-1:") + 32
-    assert set(bindings.memory_threads("chat-1")) == {
-        "chat-1",
-        renewed.memory_thread_id,
-    }
-
-    reopened = ChatBindings(database, ("local",))
-    assert reopened.get("chat-1") == renewed
+def test_removed_profile_falls_back_and_deletion_blocks_reopening(tmp_path):
+    path = tmp_path / "state.sqlite3"
+    ChatBindings(path, ["old"]).open("chat", "old")
+    current = ChatBindings(path, ["one", "two"])
+    assert current.open("chat", "old", "two").profile_id == "two"
+    assert current.open("new", "missing").profile_id == "one"
+    current.delete("chat")
+    assert current.get("chat") is None
+    with pytest.raises(RuntimeError, match="deleted"):
+        current.open("chat")
 
 
-def test_available_profile_is_immutable(tmp_path: Path) -> None:
-    bindings = ChatBindings(tmp_path / "bindings.sqlite3", ("first", "second"))
-    bindings.open("chat-1", "first")
-
-    with pytest.raises(ValueError, match="cannot change"):
-        bindings.open("chat-1", "second")
-
-    assert bindings.get("chat-1").profile_id == "first"  # type: ignore[union-attr]
-
-
-def test_stale_profile_can_be_replaced_by_an_available_profile(
-    tmp_path: Path,
-) -> None:
-    database = tmp_path / "bindings.sqlite3"
-    ChatBindings(database, ("removed",)).open("chat-1", "removed")
-
-    current = ChatBindings(database, ("current",))
-    migrated = current.open("chat-1", "current")
-
-    assert migrated.profile_id == "current"
-    assert ChatBindings(database, ("current",)).get("chat-1") == migrated
-
-
-def test_unknown_profile_is_rejected_without_creating_a_chat(tmp_path: Path) -> None:
-    bindings = ChatBindings(tmp_path / "bindings.sqlite3", ("local",))
-
-    with pytest.raises(ValueError, match="Unknown Model Profile"):
-        bindings.open("chat-1", "missing")
-
-    assert bindings.get("chat-1") is None
-
-
-def test_locked_mode_is_idempotent_but_cannot_change(tmp_path: Path) -> None:
-    bindings = ChatBindings(tmp_path / "bindings.sqlite3", ("local",))
-    bindings.open("chat-1", "local")
-    bindings.select_mode("chat-1", AgentMode.HOST_FILES)
-    locked = bindings.lock("chat-1")
-
-    assert bindings.lock("chat-1") == locked
-    assert bindings.select_mode("chat-1", AgentMode.HOST_FILES) == locked
-    with pytest.raises(ValueError, match="cannot change"):
-        bindings.select_mode("chat-1", AgentMode.CHAT_FILES)
-    assert bindings.get("chat-1") == locked
-
-
-def test_instances_observe_authoritative_sqlite_state(tmp_path: Path) -> None:
-    database = tmp_path / "bindings.sqlite3"
-    first = ChatBindings(database, ("local",))
-    second = ChatBindings(database, ("local",))
-    first.open("chat-1", "local")
-    assert first.get("chat-1").mode is AgentMode.CHAT_FILES  # type: ignore[union-attr]
-
-    second.select_mode("chat-1", AgentMode.HOST_FILES)
-
-    assert first.get("chat-1").mode is AgentMode.HOST_FILES  # type: ignore[union-attr]
-
-
-def test_new_memory_thread_preserves_chat_configuration(tmp_path: Path) -> None:
-    bindings = ChatBindings(tmp_path / "bindings.sqlite3", ("local",))
-    bindings.open("chat-1", "local")
-    bindings.select_mode("chat-1", AgentMode.HOST_FILES)
-    before = bindings.lock("chat-1")
-
-    first = bindings.new_memory_thread("chat-1")
-    second = bindings.new_memory_thread("chat-1")
-
-    assert (first.profile_id, first.mode, first.mode_locked) == (
-        before.profile_id,
-        before.mode,
-        before.mode_locked,
-    )
-    assert first.memory_thread_id != before.memory_thread_id
-    assert second.memory_thread_id != first.memory_thread_id
-
-
-def test_only_a_tracked_memory_thread_can_be_activated(tmp_path: Path) -> None:
-    bindings = ChatBindings(tmp_path / "bindings.sqlite3", ("local",))
-    bindings.open("chat-1", "local")
-    reserved = bindings.reserve_memory_thread("chat-1")
-
-    assert bindings.use_memory_thread("chat-1", reserved).memory_thread_id == reserved
-    with pytest.raises(ValueError, match="Unknown Agent Memory thread"):
-        bindings.use_memory_thread("chat-1", "chat-1:untracked")
-    with pytest.raises(ValueError, match="another Chat"):
-        bindings.use_memory_thread("chat-1", "chat-2:foreign")
-
-
-def test_delete_removes_the_persisted_binding(tmp_path: Path) -> None:
-    database = tmp_path / "bindings.sqlite3"
-    bindings = ChatBindings(database, ("local",))
-    bindings.open("chat-1", "local")
-
-    bindings.delete("chat-1")
-    bindings.delete("chat-1")
-
-    assert bindings.get("chat-1") is None
-    assert bindings.memory_threads("chat-1") == ()
-    assert bindings.is_deleting("chat-1") is True
-    with pytest.raises(RuntimeError, match="being deleted"):
-        bindings.open("chat-1", "local")
-    assert ChatBindings(database, ("local",)).get("chat-1") is None
-
-
-def test_missing_chat_mutations_fail_without_creating_state(tmp_path: Path) -> None:
-    bindings = ChatBindings(tmp_path / "bindings.sqlite3", ("local",))
-
-    for mutate in (
-        lambda: bindings.select_mode("missing", AgentMode.HOST_FILES),
-        lambda: bindings.lock("missing"),
-        lambda: bindings.new_memory_thread("missing"),
-    ):
-        with pytest.raises(KeyError):
-            mutate()
-    assert bindings.get("missing") is None
-
-
-def test_legacy_schema_without_mode_preserves_host_access_and_locks_mode(
-    tmp_path: Path,
-) -> None:
-    database = tmp_path / "bindings.sqlite3"
-    with sqlite3.connect(database) as connection:
-        connection.execute(
-            """CREATE TABLE active_branches (
-                   chat_id TEXT PRIMARY KEY,
-                   profile_id TEXT NOT NULL,
-                   checkpoint_ns TEXT NOT NULL
-               )"""
+@pytest.mark.parametrize("table", ["chat_bindings", "active_branches"])
+@pytest.mark.parametrize("mode", ["extended", "read_only", "host_files", "chat_files"])
+def test_legacy_bindings_keep_profile_and_remove_capability_modes(
+    tmp_path, table, mode
+):
+    path = tmp_path / "state.sqlite3"
+    with sqlite3.connect(path) as db:
+        db.execute(
+            f"CREATE TABLE {table} (chat_id TEXT, profile_id TEXT, agent_mode TEXT)"
         )
-        connection.execute(
-            "INSERT INTO active_branches VALUES ('legacy', 'local', 'old-branch')"
-        )
-
-    migrated = ChatBindings(database, ("local",))
-
-    assert migrated.get("legacy") == ChatBinding(
-        "local", AgentMode.HOST_FILES, True, "legacy"
-    )
-    assert ChatBindings(database, ("local",)).get("legacy") == migrated.get("legacy")
-
-
-@pytest.mark.parametrize("legacy_mode", ["read_only", "extended"])
-def test_legacy_named_modes_preserve_their_previous_host_read_scope(
-    tmp_path: Path, legacy_mode: str
-) -> None:
-    database = tmp_path / f"bindings-{legacy_mode}.sqlite3"
-    with sqlite3.connect(database) as connection:
-        connection.execute(
-            """CREATE TABLE chat_bindings (
-                   chat_id TEXT PRIMARY KEY,
-                   profile_id TEXT NOT NULL,
-                   memory_thread_id TEXT NOT NULL,
-                   agent_mode TEXT NOT NULL
-                       CHECK(agent_mode IN ('read_only', 'extended')),
-                   mode_locked INTEGER NOT NULL CHECK(mode_locked IN (0, 1))
-               )"""
-        )
-        connection.execute(
-            "INSERT INTO chat_bindings VALUES (?, ?, ?, ?, ?)",
-            ("chat-1", "local", "chat-1", legacy_mode, 1),
-        )
-
-    migrated = ChatBindings(database, ("local",))
-
-    assert migrated.get("chat-1") == ChatBinding(
-        "local", AgentMode.HOST_FILES, True, "chat-1"
-    )
-
-
-@pytest.mark.parametrize("mode_locked", [0, 1])
-def test_invalid_mode_fails_closed_without_changing_its_lock(
-    tmp_path: Path, mode_locked: int
-) -> None:
-    database = tmp_path / f"bindings-{mode_locked}.sqlite3"
-    with sqlite3.connect(database) as connection:
-        connection.execute(
-            """CREATE TABLE active_branches (
-                   chat_id TEXT PRIMARY KEY,
-                   profile_id TEXT NOT NULL,
-                   checkpoint_ns TEXT NOT NULL,
-                   agent_mode TEXT NOT NULL,
-                   mode_locked INTEGER NOT NULL
-               )"""
-        )
-        connection.execute(
-            "INSERT INTO active_branches VALUES (?, ?, ?, ?, ?)",
-            ("chat-1", "local", "branch", "unknown", mode_locked),
-        )
-
-    migrated = ChatBindings(database, ("local",))
-
-    assert migrated.get("chat-1") == ChatBinding(
-        "local", AgentMode.CHAT_FILES, bool(mode_locked), "chat-1"
-    )
-    assert ChatBindings(database, ("local",)).get("chat-1") == migrated.get("chat-1")
-
-
-@pytest.mark.parametrize("legacy_mode", ["read_only", "extended"])
-def test_checked_legacy_active_branch_mode_migrates_without_constraint_failure(
-    tmp_path: Path, legacy_mode: str
-) -> None:
-    database = tmp_path / f"active-{legacy_mode}.sqlite3"
-    with sqlite3.connect(database) as connection:
-        connection.execute(
-            """CREATE TABLE active_branches (
-                   chat_id TEXT PRIMARY KEY,
-                   profile_id TEXT NOT NULL,
-                   checkpoint_ns TEXT NOT NULL,
-                   agent_mode TEXT NOT NULL
-                       CHECK(agent_mode IN ('read_only', 'extended')),
-                   mode_locked INTEGER NOT NULL
-               )"""
-        )
-        connection.execute(
-            "INSERT INTO active_branches VALUES (?, ?, ?, ?, ?)",
-            ("chat-1", "local", "branch", legacy_mode, 1),
-        )
-
-    migrated = ChatBindings(database, ("local",))
-
-    assert migrated.get("chat-1") == ChatBinding(
-        "local", AgentMode.HOST_FILES, True, "chat-1"
-    )
+        db.execute(f"INSERT INTO {table} VALUES (?, ?, ?)", ("chat", "two", mode))
+    bindings = ChatBindings(path, ["one", "two"])
+    assert bindings.get("chat").profile_id == "two"
+    assert not hasattr(bindings.get("chat"), "mode")
+    with sqlite3.connect(path) as db:
+        assert not db.execute(
+            "SELECT name FROM sqlite_master WHERE name=?", (table,)
+        ).fetchall()
+    assert ChatBindings(path, ["one", "two"]).get("chat").profile_id == "two"

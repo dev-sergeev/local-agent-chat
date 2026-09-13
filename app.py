@@ -15,10 +15,9 @@ from fastapi.responses import FileResponse
 from langchain.chat_models import init_chat_model
 
 from local_agent_chat.agent_events import safe_text
-from local_agent_chat.agent_modes import AgentMode
+from local_agent_chat.agent_execution import AgentExecution
 from local_agent_chat.auxiliary_labels import AuxiliaryLabels
 from local_agent_chat.chainlit_data import create_chainlit_data_layer
-from local_agent_chat.chainlit_mode_guard import install_mode_acceptance_guard
 from local_agent_chat.chainlit_stop import install_localized_stop_compatibility
 from local_agent_chat.chainlit_ui import ChainlitTurnView
 from local_agent_chat.chainlit_uploads import (
@@ -26,24 +25,20 @@ from local_agent_chat.chainlit_uploads import (
     install_unrestricted_file_upload_compatibility,
 )
 from local_agent_chat.chat_bindings import ChatBinding, ChatBindings
-from local_agent_chat.chat_configuration import ChatConfigurations
 from local_agent_chat.chat_titles import (
     CHAT_TITLE_FALLBACK,
     CHAT_TITLE_PENDING,
     chat_title_source,
     fallback_chat_title,
 )
-from local_agent_chat.deep_agent_execution import DeepAgentExecution
 from local_agent_chat.llm_retry import RetryBlock
 from local_agent_chat.local_storage import LocalStorageClient
-from local_agent_chat.long_term_memory import MarkdownMemory
 from local_agent_chat.proxy_prefix import (
     RestoreProxyMethodMiddleware,
     RestoreProxyPrefixMiddleware,
 )
 from local_agent_chat.runtime import ChatRuntime
 from local_agent_chat.sandbox_files import SandboxFiles
-from local_agent_chat.sandbox_provider import LocalSandboxManager
 from local_agent_chat.settings import load_settings
 from local_agent_chat.sqlite_history import SQLiteHistory
 
@@ -78,13 +73,7 @@ sandbox_files = SandboxFiles(
     max_file_bytes=100 * 1024 * 1024,
     max_chat_bytes=1024 * 1024 * 1024,
 )
-project_skills_dir = Path(__file__).resolve().parent / "skills"
-sandbox_manager = LocalSandboxManager(
-    sandbox_files,
-    system_read_roots=(project_skills_dir,),
-)
 runtime_history = SQLiteHistory(settings.data_dir / "runtime-history.sqlite3")
-long_term_memory = MarkdownMemory(settings.data_dir / "memory" / "MEMORY.md")
 checkpoint_database = settings.data_dir / "checkpoints.sqlite3"
 chat_bindings = ChatBindings(
     checkpoint_database,
@@ -92,28 +81,14 @@ chat_bindings = ChatBindings(
 )
 retry_block = RetryBlock(settings.llm_retry, init_chat_model)
 auxiliary_labels = AuxiliaryLabels(settings.models, chat_bindings, retry_block)
-agent_execution = DeepAgentExecution(
+agent_execution = AgentExecution(
     checkpoint_database,
     settings.models,
-    sandbox_manager,
-    global_memory=runtime_history,
-    long_term_memory=long_term_memory,
-    retry_block=retry_block,
-    skills_dir=project_skills_dir,
-    chat_bindings=chat_bindings,
-)
-chat_configurations = ChatConfigurations(
+    sandbox_files,
     chat_bindings,
-    (model.id for model in settings.models),
-    chainlit_layer.has_user_request,
-)
-install_mode_acceptance_guard(
-    lambda chat_id, profile, host_files: chat_configurations.select_mode(
-        chat_id,
-        AgentMode.HOST_FILES if host_files else AgentMode.CHAT_FILES,
-        profile,
-    ),
-    chat_configurations.accept_message,
+    runtime_history,
+    config=settings.agent,
+    retry_block=retry_block,
 )
 
 runtime = ChatRuntime(
@@ -158,7 +133,6 @@ async def cleanup_chat(chat_id: str) -> None:
 
         async def delete_state() -> None:
             await agent_execution.delete_chat(chat_id)
-            await sandbox_manager.delete_chat(chat_id)
             await sandbox_files.delete_chat(chat_id)
             await runtime_history.delete_chat(chat_id)
 
@@ -251,7 +225,6 @@ async def _publish_chat_title(chat_id: str, request_text: str) -> None:
 
 def _remember_chat_configuration(binding: ChatBinding) -> None:
     cl.user_session.set("model_profile", binding.profile_id)
-    cl.user_session.set("agent_mode", binding.mode.value)
 
 
 async def _persist_chat_configuration(chat_id: str, binding: ChatBinding) -> None:
@@ -259,8 +232,6 @@ async def _persist_chat_configuration(chat_id: str, binding: ChatBinding) -> Non
         chat_id,
         metadata={
             "model_profile": binding.profile_id,
-            "agent_mode": binding.mode.value,
-            "agent_mode_locked": binding.mode_locked,
         },
     )
 
@@ -270,34 +241,18 @@ async def _sync_chat_configuration(
 ) -> None:
     _remember_chat_configuration(binding)
     await _persist_chat_configuration(chat_id, binding)
-    await _send_chat_settings(binding, refresh=refresh)
+    await _send_chat_settings(refresh=refresh)
 
 
-async def _send_chat_settings(binding: ChatBinding, *, refresh: bool = False) -> None:
+async def _send_chat_settings(*, refresh: bool = False) -> None:
     detailed = bool(cl.user_session.get("show_tool_details", False))
     chat_settings = cl.ChatSettings(
         [
             Switch(
-                id="host_files_access",
-                label="Чтение файлов с диска",
-                initial=binding.mode is AgentMode.HOST_FILES,
-                tooltip=(
-                    "Разрешает чтение файлов с диска. Создание, изменение и "
-                    "удаление файлов, а также выполнение команд недоступны в "
-                    "обоих режимах. Выбор фиксируется после первого сообщения."
-                ),
-                description=(
-                    "Выключено: только файлы, загруженные в этот диалог. "
-                    "Включено: чтение и поиск по абсолютным путям, доступным "
-                    "процессу приложения."
-                ),
-                disabled=binding.mode_locked,
-            ),
-            Switch(
                 id="show_tool_details",
                 label="Подробные результаты инструментов",
                 initial=detailed,
-                tooltip="Показывать более полные результаты чтения, поиска и памяти.",
+                tooltip="Показывать более полные результаты чтения и поиска.",
             ),
         ]
     )
@@ -310,18 +265,18 @@ async def _send_chat_settings(binding: ChatBinding, *, refresh: bool = False) ->
 @cl.on_chat_start
 async def on_chat_start():
     chat_id = _thread_id()
-    binding = chat_configurations.open(
+    binding = chat_bindings.open(
         chat_id,
         cl.user_session.get("chat_profile"),
     )
     _remember_chat_configuration(binding)
-    await _send_chat_settings(binding)
+    await _send_chat_settings()
 
 
 @cl.on_chat_resume
 async def on_chat_resume(thread):
     chat_id = thread["id"]
-    binding = await chat_configurations.recover(
+    binding = chat_bindings.open(
         chat_id,
         thread.get("metadata", {}).get("model_profile"),
         cl.user_session.get("chat_profile"),
@@ -341,26 +296,6 @@ async def on_settings_update(updated):
     cl.user_session.set(
         "show_tool_details", bool(updated.get("show_tool_details", False))
     )
-    requested_mode = (
-        AgentMode.HOST_FILES
-        if updated.get("host_files_access") is True
-        else AgentMode.CHAT_FILES
-    )
-    chat_id = _thread_id()
-    profile_hint = cl.user_session.get("chat_profile")
-    binding = await chat_configurations.recover(chat_id, profile_hint)
-    if binding.mode_locked:
-        await _sync_chat_configuration(chat_id, binding, refresh=True)
-        return
-    binding = chat_configurations.select_mode(
-        chat_id,
-        requested_mode,
-        profile_hint,
-    )
-    if binding.mode_locked:
-        await _sync_chat_configuration(chat_id, binding, refresh=True)
-    else:
-        _remember_chat_configuration(binding)
 
 
 async def _run_turn(view: ChainlitTurnView, operation: Awaitable[str]) -> str:
@@ -375,7 +310,7 @@ async def _run_turn(view: ChainlitTurnView, operation: Awaitable[str]) -> str:
 
 
 async def _handle_message(message: cl.Message, chat_id: str) -> None:
-    binding = chat_configurations.accept_message(
+    binding = chat_bindings.open(
         chat_id,
         cl.user_session.get("chat_profile"),
     )
@@ -459,17 +394,6 @@ async def on_message(message: cl.Message):
 @cl.on_stop
 async def on_stop():
     chat_id = _thread_id()
-    if chat_id not in deleting_chats:
-        binding = chat_configurations.current(chat_id)
-        if binding is not None:
-            binding = await chat_configurations.recover(
-                chat_id,
-                binding.profile_id,
-            )
-            if binding.mode_locked:
-                await _sync_chat_configuration(chat_id, binding, refresh=True)
-            else:
-                _remember_chat_configuration(binding)
     view = active_views.get(chat_id)
     if view is not None:
         try:

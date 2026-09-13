@@ -4,15 +4,14 @@ from dataclasses import FrozenInstanceError
 
 import httpx
 import pytest
-from deepagents.backends import StateBackend
-from deepagents.middleware.summarization import SummarizationMiddleware
 from langchain.chat_models import init_chat_model
-from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain_core.messages import HumanMessage
 from langchain_openai import StreamChunkTimeoutError
 from openai import BadRequestError, InternalServerError
 
+from local_agent_chat.agent_context import ContextSummary
 from local_agent_chat.llm_retry import RetryBlock
-from local_agent_chat.settings import LLMRetryConfig, ModelProfile
+from local_agent_chat.settings import AgentConfig, LLMRetryConfig, ModelProfile
 
 
 def _profile() -> ModelProfile:
@@ -116,83 +115,6 @@ def test_create_model_rejects_reserved_overrides(reserved_key: str) -> None:
         block.create_model(_profile(), **{reserved_key: "override"})
 
     assert calls == 0
-
-
-def test_summarization_uses_provider_policy_without_nested_retry() -> None:
-    model = FakeListChatModel(responses=["summary"])
-    block = RetryBlock(LLMRetryConfig(), lambda *_args, **_kwargs: model)
-
-    middleware = block.summarization_middleware(model, StateBackend())
-
-    assert middleware.name == "SummarizationMiddleware"
-    assert middleware._lc_helper._summary_model is model
-
-
-@pytest.mark.asyncio
-async def test_stream_retry_does_not_repeat_summarization_side_effects(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    model = FakeListChatModel(responses=["unused"])
-    block = RetryBlock(
-        LLMRetryConfig(stream_retries=1),
-        lambda *_args, **_kwargs: model,
-    )
-    middleware = block.summarization_middleware(model, StateBackend())
-    offloads = 0
-    model_calls = 0
-
-    async def side_effecting_wrapper(_self, request, handler):
-        nonlocal offloads
-        offloads += 1
-        return await handler(request)
-
-    async def stalled_then_recovered(_request):
-        nonlocal model_calls
-        model_calls += 1
-        if model_calls == 1:
-            raise StreamChunkTimeoutError(0.01, chunks_received=0)
-        return "recovered"
-
-    monkeypatch.setattr(
-        SummarizationMiddleware,
-        "awrap_model_call",
-        side_effecting_wrapper,
-    )
-
-    result = await middleware.awrap_model_call(object(), stalled_then_recovered)
-
-    assert result == "recovered"
-    assert offloads == 1
-    assert model_calls == 2
-
-
-@pytest.mark.asyncio
-async def test_summary_model_uses_the_zero_chunk_retry_budget(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    model = FakeListChatModel(responses=["unused"])
-    block = RetryBlock(
-        LLMRetryConfig(stream_retries=1),
-        lambda *_args, **_kwargs: model,
-    )
-    middleware = block.summarization_middleware(model, StateBackend())
-    summary_calls = 0
-
-    async def stalled_then_recovered(_self, _messages):
-        nonlocal summary_calls
-        summary_calls += 1
-        if summary_calls == 1:
-            raise StreamChunkTimeoutError(0.01, chunks_received=0)
-        return "summary"
-
-    monkeypatch.setattr(
-        SummarizationMiddleware,
-        "_acreate_summary",
-        stalled_then_recovered,
-    )
-
-    assert await middleware._acreate_summary([]) == "summary"
-    assert summary_calls == 2
 
 
 @pytest.mark.asyncio
@@ -393,9 +315,9 @@ async def test_zero_max_retries_disables_nested_summarization_retry() -> None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
         block = _real_model_block(max_retries=0)
         model = block.create_model(_profile(), http_async_client=client)
-        middleware = block.summarization_middleware(model, StateBackend())
+        middleware = ContextSummary(model, AgentConfig(), block)
         with pytest.raises(InternalServerError):
-            await middleware._lc_helper._summary_model.ainvoke("hello")
+            await middleware._acreate_summary([HumanMessage(content="hello")])
 
     assert requests == 1
 

@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-import uuid
 from pathlib import Path
 from typing import Any
 
 import pytest
 from chainlit.context import ChainlitContext, context_var
 from chainlit.emitter import BaseChainlitEmitter
-from chainlit.server import sio
-from chainlit.session import HTTPSession, WebsocketSession
+from chainlit.session import HTTPSession
 
 
 class SilentEmitter(BaseChainlitEmitter):
@@ -80,61 +78,6 @@ async def test_chat_start_falls_back_from_a_removed_client_profile(
         assert binding.profile_id == expected_profile
         assert chat_app.cl.user_session.get("model_profile") == expected_profile
     finally:
-        await chat_app.agent_execution.close()
-        await chat_app.chainlit_layer.close()
-        sys.modules.pop(module_name, None)
-
-
-@pytest.mark.asyncio
-async def test_socket_acceptance_falls_back_from_a_removed_client_profile(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    module_name = "_model_profile_socket_app"
-    chat_app = _load_app(tmp_path, monkeypatch, module_name)
-    chat_id = "chat-socket"
-    socket_id = "socket-profile"
-    session = WebsocketSession(
-        id="profile-socket-session",
-        socket_id=socket_id,
-        emit=lambda *_args, **_kwargs: None,
-        emit_call=lambda *_args, **_kwargs: None,
-        user_env={},
-        client_type="webapp",
-        thread_id=chat_id,
-    )
-    session.chat_profile = "local"
-
-    async def ignored_event_handler(*_args) -> None:
-        return None
-
-    monkeypatch.setattr(sio.manager, "sid_from_eio_sid", lambda *_args: socket_id)
-    monkeypatch.setattr(sio.manager, "is_connected", lambda *_args: True)
-    monkeypatch.setattr(sio, "async_handlers", False)
-    monkeypatch.setattr(sio, "_handle_event_internal", ignored_event_handler)
-
-    try:
-        await sio._handle_event(
-            "engine-profile",
-            "/",
-            None,
-            [
-                "client_message",
-                {
-                    "message": {
-                        "id": str(uuid.uuid4()),
-                        "createdAt": "2026-08-25T17:00:00Z",
-                        "output": "Первое сообщение",
-                    }
-                },
-            ],
-        )
-
-        binding = chat_app.chat_bindings.get(chat_id)
-        assert binding is not None
-        assert binding.profile_id == "first"
-        assert binding.mode_locked is True
-    finally:
-        await session.delete()
         await chat_app.agent_execution.close()
         await chat_app.chainlit_layer.close()
         sys.modules.pop(module_name, None)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import isfinite
 from pathlib import Path
 
@@ -18,6 +18,19 @@ class ModelProfile:
     api_key: str | None
     base_url: str | None = None
     streaming: bool = True
+    summary_options: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.summary_options, dict):
+            raise ValueError("summary_options must be a mapping of model arguments")
+        if {
+            "max_tokens",
+            "disable_streaming",
+            "streaming",
+        } & self.summary_options.keys():
+            raise ValueError(
+                "Summary output and streaming limits are managed by the agent"
+            )
 
 
 @dataclass(frozen=True)
@@ -30,11 +43,39 @@ class LLMRetryConfig:
 
 
 @dataclass(frozen=True)
+class AgentConfig:
+    context_tokens: int = 16000
+    summary_trigger_tokens: int = 10000
+    keep_tokens: int = 3000
+    summary_tokens: int = 1000
+    max_output_tokens: int = 2000
+    max_model_calls: int = 12
+
+    def __post_init__(self) -> None:
+        if any(type(value) is not int or value < 1 for value in vars(self).values()):
+            raise ValueError("Agent limits must be positive integers")
+        if self.summary_tokens * 3 + 2000 >= self.context_tokens:
+            raise ValueError(
+                "Context must fit summary input, previous summary and output"
+            )
+        if not self.keep_tokens + self.summary_tokens < self.summary_trigger_tokens:
+            raise ValueError("Summary and retained context must fit below the trigger")
+        if (
+            self.summary_trigger_tokens + self.max_output_tokens + 2000
+            > self.context_tokens
+        ):
+            raise ValueError(
+                "Context must reserve 2000 tokens for prompts/tools and room for output"
+            )
+
+
+@dataclass(frozen=True)
 class Settings:
     root_path: str
     data_dir: Path
     models: tuple[ModelProfile, ...]
     llm_retry: LLMRetryConfig
+    agent: AgentConfig = AgentConfig()
 
 
 def _root_path(value: str) -> str:
@@ -112,6 +153,7 @@ def load_settings() -> Settings:
             api_key=os.environ.get(item["api_key_env"]),
             base_url=item.get("base_url"),
             streaming=item.get("streaming", True),
+            summary_options=item.get("summary_options", {}),
         )
         for item in document.get("models", [])
     )
@@ -124,4 +166,12 @@ def load_settings() -> Settings:
         data_dir=data_dir,
         models=profiles,
         llm_retry=llm_retry,
+        agent=AgentConfig(
+            **{
+                name: _bounded_int(
+                    f"AGENT_{name.upper()}", default, minimum=1, maximum=1_000_000
+                )
+                for name, default in vars(AgentConfig()).items()
+            }
+        ),
     )

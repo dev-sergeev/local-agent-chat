@@ -53,31 +53,6 @@ def test_tool_display_keeps_long_file_paths_distinguishable() -> None:
     assert readme.title != empty.title
 
 
-def test_tool_display_names_global_memory_actions() -> None:
-    search = tool_display(
-        "search_past_chats", '{"query":"решение по глобальной памяти"}'
-    )
-    read = tool_display("read_past_chat", '{"chat_id":"chat-42","turn_id":"turn-7"}')
-
-    assert search.title == ("Поиск в прошлых диалогах · решение по глобальной памяти")
-    assert search.icon == "history"
-    assert read.title == "Контекст прошлого диалога · chat-42"
-    assert read.icon == "book-open-text"
-
-
-def test_tool_display_names_long_term_memory_actions_without_showing_a_fact() -> None:
-    remember = tool_display(
-        "remember_context", '{"key":"user.name","fact":"[redacted]"}'
-    )
-    forget = tool_display("forget_context", '{"key":"user.name"}')
-
-    assert remember.title == "Сохранение в память · user.name"
-    assert remember.icon == "brain"
-    assert "Анна" not in remember.input
-    assert forget.title == "Удаление из памяти · user.name"
-    assert forget.icon == "eraser"
-
-
 @pytest.mark.asyncio
 async def test_complete_renders_answer_without_streamed_text(monkeypatch) -> None:
     sent = []

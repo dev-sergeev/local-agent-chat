@@ -1,180 +1,54 @@
 from __future__ import annotations
 
 import sqlite3
-import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-
-from .agent_modes import AgentMode
-
-_NORMALIZED_AGENT_MODE_SQL = """CASE
-    WHEN agent_mode IN ('read_only', 'extended', 'host_files') THEN 'host_files'
-    WHEN agent_mode = 'chat_files' THEN 'chat_files'
-    ELSE 'chat_files'
-END"""
 
 
 @dataclass(frozen=True, slots=True)
 class ChatBinding:
     profile_id: str
-    mode: AgentMode
-    mode_locked: bool
-    memory_thread_id: str
 
 
 class ChatBindings:
-    """Persist the immutable Model Profile and Agent Mode of each Chat."""
+    """The persisted model choice for each Chat; no capability modes or branches."""
 
     def __init__(self, database: Path, available_profile_ids: Iterable[str]) -> None:
-        profiles = tuple(dict.fromkeys(available_profile_ids))
-        if not profiles:
-            raise ValueError("At least one Model Profile must be available")
-        if any(not profile_id for profile_id in profiles):
-            raise ValueError("Model Profile identifiers must not be empty")
-
+        self._profiles = tuple(dict.fromkeys(available_profile_ids))
+        if not self._profiles or any(not p for p in self._profiles):
+            raise ValueError("At least one nonempty Model Profile must be available")
         self._database = database
-        self._available_profiles = frozenset(profiles)
         self._deleting: set[str] = set()
-        self._database.parent.mkdir(parents=True, exist_ok=True)
-        self._migrate()
-
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self._database)
-
-    def _migrate(self) -> None:
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            active_branches = connection.execute(
-                """SELECT 1 FROM sqlite_master
-                   WHERE type = 'table' AND name = 'active_branches'"""
-            ).fetchone()
-            if active_branches is not None:
-                columns = {
-                    row[1]
-                    for row in connection.execute("PRAGMA table_info(active_branches)")
-                }
-                legacy_registry = "agent_mode" not in columns
-                if legacy_registry:
-                    connection.execute(
-                        "ALTER TABLE active_branches ADD COLUMN "
-                        "agent_mode TEXT NOT NULL DEFAULT 'host_files'"
+        database.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS chat_profiles (chat_id TEXT PRIMARY KEY, profile_id TEXT NOT NULL)"
+            )
+            for table in ("chat_bindings", "active_branches"):
+                if db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                ).fetchone():
+                    db.execute(
+                        f"INSERT OR IGNORE INTO chat_profiles SELECT chat_id, profile_id FROM {table}"
                     )
-                if "mode_locked" not in columns:
-                    connection.execute(
-                        "ALTER TABLE active_branches ADD COLUMN "
-                        "mode_locked INTEGER NOT NULL DEFAULT 0"
-                    )
-                if legacy_registry:
-                    connection.execute("UPDATE active_branches SET mode_locked = 1")
+                    db.execute(f"DROP TABLE {table}")
+            db.execute("DROP TABLE IF EXISTS chat_memory_threads")
 
-            existing_bindings = connection.execute(
-                """SELECT 1 FROM sqlite_master
-                   WHERE type = 'table' AND name = 'chat_bindings'"""
-            ).fetchone()
-            binding_columns: set[str] = set()
-            if existing_bindings is not None:
-                binding_columns = {
-                    row[1]
-                    for row in connection.execute("PRAGMA table_info(chat_bindings)")
-                }
-                connection.execute(
-                    "ALTER TABLE chat_bindings RENAME TO previous_chat_bindings"
-                )
-
-            connection.execute(
-                """CREATE TABLE IF NOT EXISTS chat_bindings (
-                       chat_id TEXT PRIMARY KEY,
-                       profile_id TEXT NOT NULL,
-                       memory_thread_id TEXT NOT NULL,
-                       agent_mode TEXT NOT NULL DEFAULT 'chat_files'
-                           CHECK(agent_mode IN ('chat_files', 'host_files')),
-                       mode_locked INTEGER NOT NULL DEFAULT 0
-                           CHECK(mode_locked IN (0, 1))
-                   )"""
-            )
-            if existing_bindings is not None:
-                memory_thread_sql = (
-                    "COALESCE(NULLIF(memory_thread_id, ''), chat_id)"
-                    if "memory_thread_id" in binding_columns
-                    else "chat_id"
-                )
-                mode_sql = (
-                    _NORMALIZED_AGENT_MODE_SQL
-                    if "agent_mode" in binding_columns
-                    else "'host_files'"
-                )
-                locked_sql = (
-                    "CASE WHEN mode_locked = 1 THEN 1 ELSE 0 END"
-                    if "mode_locked" in binding_columns
-                    else "1"
-                )
-                connection.execute(
-                    f"""INSERT OR IGNORE INTO chat_bindings(
-                            chat_id, profile_id, memory_thread_id,
-                            agent_mode, mode_locked
-                        )
-                        SELECT chat_id, profile_id, {memory_thread_sql},
-                               {mode_sql}, {locked_sql}
-                        FROM previous_chat_bindings"""  # noqa: S608
-                )
-                connection.execute("DROP TABLE previous_chat_bindings")
-            if active_branches is not None:
-                connection.execute(
-                    f"""INSERT OR IGNORE INTO chat_bindings(
-                           chat_id, profile_id, memory_thread_id,
-                           agent_mode, mode_locked
-                       )
-                       SELECT chat_id, profile_id, chat_id,
-                              {_NORMALIZED_AGENT_MODE_SQL},
-                              CASE WHEN mode_locked = 1 THEN 1 ELSE 0 END
-                       FROM active_branches"""  # noqa: S608
-                )
-                connection.execute("DROP TABLE active_branches")
-            connection.execute(
-                """UPDATE chat_bindings SET memory_thread_id = chat_id
-                   WHERE memory_thread_id IS NULL OR memory_thread_id = ''"""
-            )
-            connection.execute(
-                """CREATE TABLE IF NOT EXISTS chat_memory_threads (
-                       chat_id TEXT NOT NULL,
-                       thread_id TEXT NOT NULL,
-                       PRIMARY KEY(chat_id, thread_id)
-                   )"""
-            )
-            connection.execute(
-                """CREATE UNIQUE INDEX IF NOT EXISTS
-                       idx_chat_memory_threads_thread_id
-                   ON chat_memory_threads(thread_id)"""
-            )
-            connection.execute(
-                """INSERT OR IGNORE INTO chat_memory_threads(chat_id, thread_id)
-                   SELECT chat_id, memory_thread_id FROM chat_bindings"""
-            )
-
-    @staticmethod
-    def _binding(row: tuple[object, ...]) -> ChatBinding:
-        return ChatBinding(
-            profile_id=str(row[0]),
-            mode=AgentMode(str(row[1])),
-            mode_locked=bool(row[2]),
-            memory_thread_id=str(row[3]),
-        )
-
-    @staticmethod
-    def _get_row(
-        connection: sqlite3.Connection, chat_id: str
-    ) -> tuple[object, ...] | None:
-        return connection.execute(
-            """SELECT profile_id, agent_mode, mode_locked, memory_thread_id
-               FROM chat_bindings WHERE chat_id = ?""",
-            (chat_id,),
-        ).fetchone()
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        with closing(sqlite3.connect(self._database, timeout=30)) as db, db:
+            yield db
 
     def get(self, chat_id: str) -> ChatBinding | None:
-        with self._connect() as connection:
-            row = self._get_row(connection, chat_id)
-        return self._binding(row) if row is not None else None
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT profile_id FROM chat_profiles WHERE chat_id=?", (chat_id,)
+            ).fetchone()
+        return ChatBinding(row[0]) if row else None
 
     def is_deleting(self, chat_id: str) -> bool:
         return chat_id in self._deleting
@@ -182,158 +56,30 @@ class ChatBindings:
     def mark_deleting(self, chat_id: str) -> None:
         self._deleting.add(chat_id)
 
-    def _ensure_active(self, chat_id: str) -> None:
+    def open(self, chat_id: str, *profile_hints: str | None) -> ChatBinding:
         if self.is_deleting(chat_id):
             raise RuntimeError("Chat is being deleted")
-
-    def open(self, chat_id: str, profile_id: str) -> ChatBinding:
-        self._ensure_active(chat_id)
-        if profile_id not in self._available_profiles:
-            raise ValueError(f"Unknown Model Profile: {profile_id}")
-
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = self._get_row(connection, chat_id)
-            if row is None:
-                connection.execute(
-                    """INSERT INTO chat_bindings(
-                           chat_id, profile_id, memory_thread_id
-                       ) VALUES (?, ?, ?)""",
-                    (chat_id, profile_id, chat_id),
-                )
-                connection.execute(
-                    """INSERT INTO chat_memory_threads(chat_id, thread_id)
-                       VALUES (?, ?)""",
-                    (chat_id, chat_id),
-                )
-            else:
-                current_profile = str(row[0])
-                if (
-                    current_profile in self._available_profiles
-                    and current_profile != profile_id
-                ):
-                    raise ValueError(
-                        "Model Profile cannot change inside an existing Chat"
-                    )
-                if current_profile != profile_id:
-                    connection.execute(
-                        "UPDATE chat_bindings SET profile_id = ? WHERE chat_id = ?",
-                        (profile_id, chat_id),
-                    )
-            persisted = self._get_row(connection, chat_id)
-
-        if persisted is None:  # pragma: no cover - guarded by the transaction above
-            raise RuntimeError("Chat binding was not persisted")
-        return self._binding(persisted)
-
-    def select_mode(self, chat_id: str, mode: AgentMode) -> ChatBinding:
-        self._ensure_active(chat_id)
-        requested = AgentMode(mode)
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = self._get_row(connection, chat_id)
-            if row is None:
-                raise KeyError(chat_id)
-            current = AgentMode(str(row[1]))
-            if bool(row[2]) and current is not requested:
-                raise ValueError("Agent Mode cannot change after the first Turn")
-            if not bool(row[2]) and current is not requested:
-                connection.execute(
-                    "UPDATE chat_bindings SET agent_mode = ? WHERE chat_id = ?",
-                    (requested.value, chat_id),
-                )
-            persisted = self._get_row(connection, chat_id)
-
-        if persisted is None:  # pragma: no cover - guarded by the transaction above
-            raise RuntimeError("Chat binding disappeared during mode selection")
-        return self._binding(persisted)
-
-    def lock(self, chat_id: str) -> ChatBinding:
-        self._ensure_active(chat_id)
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            if self._get_row(connection, chat_id) is None:
-                raise KeyError(chat_id)
-            connection.execute(
-                "UPDATE chat_bindings SET mode_locked = 1 WHERE chat_id = ?",
-                (chat_id,),
-            )
-            persisted = self._get_row(connection, chat_id)
-
-        if persisted is None:  # pragma: no cover - guarded by the transaction above
-            raise RuntimeError("Chat binding disappeared while locking its mode")
-        return self._binding(persisted)
-
-    @staticmethod
-    def _validate_memory_thread(chat_id: str, thread_id: str) -> None:
-        if thread_id != chat_id and not thread_id.startswith(f"{chat_id}:"):
-            raise ValueError("Agent Memory thread belongs to another Chat")
-
-    def reserve_memory_thread(self, chat_id: str) -> str:
-        self._ensure_active(chat_id)
-        thread_id = f"{chat_id}:{uuid.uuid4().hex}"
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            if self._get_row(connection, chat_id) is None:
-                raise KeyError(chat_id)
-            connection.execute(
-                """INSERT INTO chat_memory_threads(chat_id, thread_id)
-                   VALUES (?, ?)""",
-                (chat_id, thread_id),
-            )
-        return thread_id
-
-    def use_memory_thread(self, chat_id: str, thread_id: str) -> ChatBinding:
-        self._ensure_active(chat_id)
-        self._validate_memory_thread(chat_id, thread_id)
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            tracked = connection.execute(
-                """SELECT 1 FROM chat_memory_threads
-                   WHERE chat_id = ? AND thread_id = ?""",
-                (chat_id, thread_id),
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT profile_id FROM chat_profiles WHERE chat_id=?", (chat_id,)
             ).fetchone()
-            if tracked is None:
-                raise ValueError("Unknown Agent Memory thread")
-            connection.execute(
-                "UPDATE chat_bindings SET memory_thread_id = ? WHERE chat_id = ?",
-                (thread_id, chat_id),
+            # A valid persisted profile is immutable. Removed profiles fall back
+            # to an available hint or the configured default on resume.
+            profile = (
+                row[0]
+                if row and row[0] in self._profiles
+                else next(
+                    (hint for hint in profile_hints if hint in self._profiles),
+                    self._profiles[0],
+                )
             )
-            persisted = self._get_row(connection, chat_id)
-
-        if persisted is None:  # pragma: no cover - guarded by the transaction above
-            raise RuntimeError("Chat binding disappeared while selecting Agent Memory")
-        return self._binding(persisted)
-
-    def new_memory_thread(self, chat_id: str) -> ChatBinding:
-        return self.use_memory_thread(chat_id, self.reserve_memory_thread(chat_id))
-
-    def owns_memory_thread(self, chat_id: str, thread_id: str) -> bool:
-        self._validate_memory_thread(chat_id, thread_id)
-        with self._connect() as connection:
-            row = connection.execute(
-                """SELECT 1 FROM chat_memory_threads
-                   WHERE chat_id = ? AND thread_id = ?""",
-                (chat_id, thread_id),
-            ).fetchone()
-        return row is not None
-
-    def memory_threads(self, chat_id: str) -> tuple[str, ...]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                """SELECT thread_id FROM chat_memory_threads
-                   WHERE chat_id = ? ORDER BY thread_id""",
-                (chat_id,),
-            ).fetchall()
-        return tuple(str(row[0]) for row in rows)
+            db.execute(
+                "INSERT OR REPLACE INTO chat_profiles VALUES (?, ?)", (chat_id, profile)
+            )
+        return ChatBinding(profile)
 
     def delete(self, chat_id: str) -> None:
         self.mark_deleting(chat_id)
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                "DELETE FROM chat_memory_threads WHERE chat_id = ?", (chat_id,)
-            )
-            connection.execute(
-                "DELETE FROM chat_bindings WHERE chat_id = ?", (chat_id,)
-            )
+        with self._connect() as db:
+            db.execute("DELETE FROM chat_profiles WHERE chat_id=?", (chat_id,))

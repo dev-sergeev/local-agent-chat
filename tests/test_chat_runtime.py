@@ -403,7 +403,7 @@ class ChatRuntimeTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(KeyError):
                 await reopened.get("turn-2")
 
-    async def test_late_revision_failure_restores_sqlite_history_and_search(
+    async def test_late_revision_failure_restores_sqlite_history(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -428,21 +428,6 @@ class ChatRuntimeTest(unittest.IsolatedAsyncioTestCase):
             reopened = SQLiteHistory(database)
             self.assertEqual((await reopened.get("turn-1")).text, "original-orchid")
             self.assertEqual((await reopened.get("turn-2")).text, "later-tulip")
-            self.assertFalse(
-                await reopened.search_past_chats(
-                    "revised-lavender", exclude_chat_id="different-chat"
-                )
-            )
-            self.assertEqual(
-                [
-                    hit.turn_id
-                    for hit in await reopened.search_past_chats(
-                        "original-orchid later-tulip",
-                        exclude_chat_id="different-chat",
-                    )
-                ],
-                ["turn-2", "turn-1"],
-            )
 
     async def test_sqlite_history_reports_whether_chat_has_turns(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

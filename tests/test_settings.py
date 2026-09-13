@@ -38,6 +38,21 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.llm_retry, LLMRetryConfig())
         self.assertNotIn("secret-value", yaml_text)
 
+    def test_loads_summary_model_options(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / "models.yaml"
+            profile.write_text(
+                "models:\n  - id: test\n    label: Test\n    model: openai:test\n"
+                "    api_key_env: TEST_KEY\n    summary_options:\n"
+                "      extra_body:\n        reasoning:\n          enabled: false\n"
+            )
+            with patch.dict(os.environ, {"MODEL_PROFILES_FILE": str(profile)}):
+                settings = load_settings()
+        self.assertEqual(
+            settings.models[0].summary_options,
+            {"extra_body": {"reasoning": {"enabled": False}}},
+        )
+
     def test_loads_llm_retry_configuration_from_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

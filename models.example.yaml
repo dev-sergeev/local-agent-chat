@@ -4,3 +4,7 @@ models:
     model: openai:deepseek/deepseek-v4-flash-0731
     api_key_env: OPENAI_API_KEY
     streaming: true
+    summary_options:
+      extra_body:
+        reasoning:
+          enabled: false
