@@ -5,11 +5,22 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "local-agent-chat"
 version = "0.1.0"
-description = "LocalChat single-user UI for a sandboxed ReAct agent in JupyterHub"
+description = "Local chat UI with persistent history and a sandboxed ReAct agent"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.14"
+authors = [{name = "dev-sergeev"}]
+keywords = ["chat", "llm", "chainlit", "react-agent", "localchat"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Web Environment",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
   "chainlit>=2.11,<2.12",
   "langchain>=1.2,<2",
@@ -18,7 +29,17 @@ dependencies = [
   "SQLAlchemy>=2.0,<3",
   "PyYAML>=6,<7",
   "python-dotenv>=1,<2",
+  "platformdirs>=4,<5",
 ]
+
+[project.scripts]
+localchat = "local_agent_chat.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/dev-sergeev/local-agent-chat"
+Documentation = "https://github.com/dev-sergeev/local-agent-chat#readme"
+Issues = "https://github.com/dev-sergeev/local-agent-chat/issues"
+Source = "https://github.com/dev-sergeev/local-agent-chat"
 
 [project.optional-dependencies]
 test = [
@@ -31,6 +52,19 @@ test = [
 
 [tool.setuptools.packages.find]
 include = ["local_agent_chat*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+local_agent_chat = [
+  "assets/*.md",
+  "assets/chainlit/*.toml",
+  "assets/chainlit/translations/*.json",
+  "assets/public/*.css",
+  "assets/public/*.js",
+  "assets/public/*.png",
+  "assets/public/avatars/*.png",
+  "assets/examples/*",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

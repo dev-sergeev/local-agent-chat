@@ -92,7 +92,7 @@ async def test_transient_chat_title_failure_retries_on_next_turn(
         lambda *_args, **_kwargs: title_model,
     )
     module_name = "_chat_title_lifecycle_app"
-    app_path = Path(__file__).parents[1] / "app.py"
+    app_path = Path(__file__).parents[1] / "local_agent_chat" / "app.py"
     spec = importlib.util.spec_from_file_location(module_name, app_path)
     assert spec is not None and spec.loader is not None
     chat_app = importlib.util.module_from_spec(spec)

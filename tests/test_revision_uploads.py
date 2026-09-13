@@ -61,7 +61,7 @@ async def test_revised_message_upload_is_available_to_agent(
     )
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     module_name = f"_revision_upload_{commit_failure}_app"
-    app_path = Path(__file__).parents[1] / "app.py"
+    app_path = Path(__file__).parents[1] / "local_agent_chat" / "app.py"
     spec = importlib.util.spec_from_file_location(module_name, app_path)
     assert spec is not None and spec.loader is not None
     chat_app = importlib.util.module_from_spec(spec)

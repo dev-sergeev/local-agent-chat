@@ -67,10 +67,10 @@ def _rgba_pixels(path: Path) -> tuple[tuple[int, int], list[tuple[int, ...]]]:
 
 def test_brand_assets_are_transparent_and_use_the_primary_color() -> None:
     assets = {
-        Path("public/localchat-logo.png"): (2087, 753),
-        Path("public/localchat-icon.png"): (1254, 1254),
-        Path("public/avatars/localchat.png"): (512, 512),
-        Path("public/favicon.png"): (256, 256),
+        Path("local_agent_chat/assets/public/localchat-logo.png"): (2087, 753),
+        Path("local_agent_chat/assets/public/localchat-icon.png"): (1254, 1254),
+        Path("local_agent_chat/assets/public/avatars/localchat.png"): (512, 512),
+        Path("local_agent_chat/assets/public/favicon.png"): (256, 256),
     }
 
     for path, expected_size in assets.items():
@@ -83,7 +83,11 @@ def test_brand_assets_are_transparent_and_use_the_primary_color() -> None:
 
 
 def test_theme_wordmarks_match_the_canonical_logo() -> None:
-    canonical = Path("public/localchat-logo.png").read_bytes()
+    canonical = Path("local_agent_chat/assets/public/localchat-logo.png").read_bytes()
 
-    assert Path("public/logo_dark.png").read_bytes() == canonical
-    assert Path("public/logo_light.png").read_bytes() == canonical
+    assert (
+        Path("local_agent_chat/assets/public/logo_dark.png").read_bytes() == canonical
+    )
+    assert (
+        Path("local_agent_chat/assets/public/logo_light.png").read_bytes() == canonical
+    )

@@ -75,7 +75,7 @@ async def chat(tmp_path, monkeypatch, request):
         sio.handlers["/"], "edit_message", sio.handlers["/"]["edit_message"]
     )
     spec = importlib.util.spec_from_file_location(
-        "_revision_lifecycle_app", Path("app.py")
+        "_revision_lifecycle_app", Path("local_agent_chat/app.py")
     )
     app = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = app

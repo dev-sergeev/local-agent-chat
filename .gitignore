@@ -5,6 +5,7 @@
 models.yaml
 .local-agent-chat/
 .files/
+.chainlit/
 __pycache__/
 .pytest_cache/
 .ruff_cache/

@@ -40,7 +40,7 @@ def _profiles_file(tmp_path: Path) -> Path:
 def _load_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module_name: str):
     monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "app-data"))
     monkeypatch.setenv("MODEL_PROFILES_FILE", str(_profiles_file(tmp_path)))
-    app_path = Path(__file__).parents[1] / "app.py"
+    app_path = Path(__file__).parents[1] / "local_agent_chat" / "app.py"
     spec = importlib.util.spec_from_file_location(module_name, app_path)
     assert spec is not None and spec.loader is not None
     chat_app = importlib.util.module_from_spec(spec)

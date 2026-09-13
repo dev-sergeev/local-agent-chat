@@ -6,7 +6,8 @@ from math import isfinite
 from pathlib import Path
 
 import yaml
-from dotenv import load_dotenv
+
+from .installation import config_directory, data_directory
 
 
 @dataclass(frozen=True)
@@ -140,10 +141,30 @@ def _llm_retry_config() -> LLMRetryConfig:
 
 
 def load_settings() -> Settings:
-    load_dotenv(override=False)
     llm_retry = _llm_retry_config()
-    profiles_path = Path(os.environ.get("MODEL_PROFILES_FILE", "models.yaml"))
-    document = yaml.safe_load(profiles_path.read_text(encoding="utf-8")) or {}
+    profiles_path = Path(
+        os.environ.get("MODEL_PROFILES_FILE") or config_directory() / "models.yaml"
+    )
+    try:
+        document = yaml.safe_load(profiles_path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as error:
+        raise ValueError(f"Invalid YAML in {profiles_path}.") from error
+    if not isinstance(document, dict) or not isinstance(document.get("models"), list):
+        raise ValueError(f"{profiles_path} must contain a models list.")
+    identifiers = set()
+    for index, item in enumerate(document["models"], 1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Model profile {index} must be a mapping.")
+        for key in ("id", "label", "model", "api_key_env"):
+            if not isinstance(item.get(key), str) or not item[key].strip():
+                raise ValueError(f"Model profile {index} requires a nonempty {key}.")
+        if item["id"] in identifiers:
+            raise ValueError("Model profile ids must be unique.")
+        identifiers.add(item["id"])
+        if type(item.get("streaming", True)) is not bool:
+            raise ValueError(f"Model profile {index}: streaming must be true or false.")
+        if item.get("base_url") is not None and not isinstance(item["base_url"], str):
+            raise ValueError(f"Model profile {index}: base_url must be a URL string.")
     profiles = tuple(
         ModelProfile(
             id=item["id"],
@@ -160,7 +181,7 @@ def load_settings() -> Settings:
     if not profiles:
         raise ValueError("At least one Model Profile must be configured")
 
-    data_dir = Path(os.environ.get("APP_DATA_DIR", ".local-agent-chat")).resolve()
+    data_dir = Path(os.environ.get("APP_DATA_DIR") or data_directory()).resolve()
     return Settings(
         root_path=_root_path(os.environ.get("APP_ROOT_PATH", "")),
         data_dir=data_dir,

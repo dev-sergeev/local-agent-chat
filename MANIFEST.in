@@ -1,0 +1,6 @@
+include LICENSE README.md CONTRIBUTING.md SECURITY.md CONTEXT.md
+include .env.example models.example.yaml
+include scripts/run.sh scripts/check_distribution.py
+recursive-include tests *.py
+recursive-include docs *.md
+global-exclude *.pyc

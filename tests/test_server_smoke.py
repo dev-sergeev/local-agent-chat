@@ -2,6 +2,7 @@ import os
 import socket
 import sqlite3
 import subprocess
+import sys
 import time
 import uuid
 from hashlib import sha256
@@ -26,10 +27,12 @@ def test_chainlit_server_works_behind_root_path(tmp_path: Path) -> None:
     }
     process = subprocess.Popen(
         [
-            "chainlit",
+            sys.executable,
+            "-m",
+            "local_agent_chat",
             "run",
-            "app.py",
-            "--headless",
+            "--config-dir",
+            str(tmp_path / "config"),
             "--host",
             "127.0.0.1",
             "--port",
@@ -161,9 +164,13 @@ def test_chainlit_server_works_behind_root_path(tmp_path: Path) -> None:
         assert "--localchat-brand-primary: #E13662" in branding.text
         assert "var(--localchat-brand-primary)" in branding.text
         assert "width: min(420px, calc(100vw - 3rem))" in branding.text
-        wordmark_bytes = Path("public/localchat-logo.png").read_bytes()
-        avatar_bytes = Path("public/avatars/localchat.png").read_bytes()
-        favicon_bytes = Path("public/favicon.png").read_bytes()
+        wordmark_bytes = Path(
+            "local_agent_chat/assets/public/localchat-logo.png"
+        ).read_bytes()
+        avatar_bytes = Path(
+            "local_agent_chat/assets/public/avatars/localchat.png"
+        ).read_bytes()
+        favicon_bytes = Path("local_agent_chat/assets/public/favicon.png").read_bytes()
         logo_version = sha256(wordmark_bytes).hexdigest()
         avatar_version = sha256(avatar_bytes).hexdigest()
         versioned_logo_url = f"{prefix}/public/localchat-logo.png?v={logo_version}"

@@ -25,4 +25,7 @@ fi
 
 export CHAINLIT_AUTH_SECRET MODEL_PROFILES_FILE APP_DATA_DIR APP_ROOT_PATH APP_HOST APP_PORT
 cd "$PROJECT_ROOT"
-exec chainlit run app.py --headless --host "$APP_HOST" --port "$APP_PORT" --root-path "$APP_ROOT_PATH"
+# Resolve the historical checkout-relative data paths before the packaged CLI.
+export MODEL_PROFILES_FILE="$(realpath -m "$MODEL_PROFILES_FILE")"
+export APP_DATA_DIR="$(realpath -m "$APP_DATA_DIR")"
+exec python -m local_agent_chat run --config-dir "$PROJECT_ROOT" --host "$APP_HOST" --port "$APP_PORT" --root-path "$APP_ROOT_PATH"

@@ -49,7 +49,7 @@ from local_agent_chat.settings import load_settings
 from local_agent_chat.sqlite_history import SQLiteHistory
 
 settings = load_settings()
-public_dir = Path(__file__).resolve().parent / "public"
+public_dir = Path(__file__).resolve().parent / "assets" / "public"
 logo_path = public_dir / "localchat-logo.png"
 avatar_path = public_dir / "avatars" / "localchat.png"
 logo_version = sha256(logo_path.read_bytes()).hexdigest()
@@ -479,13 +479,15 @@ if getattr(app.state, "_localchat_base_lifespan", None) is None:
 
     @asynccontextmanager
     async def localchat_lifespan(application):
-        try:
-            async with application.state._localchat_base_lifespan(application) as state:
+        async with application.state._localchat_base_lifespan(application) as state:
+            try:
                 yield state
-        finally:
-            cleanup = getattr(application.state, "_localchat_close_resources", None)
-            if cleanup is not None:
-                await cleanup()
+            finally:
+                # Chainlit's outer shutdown force-exits the process; close our
+                # resources before handing control back to its lifespan.
+                cleanup = getattr(application.state, "_localchat_close_resources", None)
+                if cleanup is not None:
+                    await cleanup()
 
     app.router.lifespan_context = localchat_lifespan
 

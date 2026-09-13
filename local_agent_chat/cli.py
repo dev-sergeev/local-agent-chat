@@ -1,0 +1,327 @@
+"""Configure and launch LocalChat without importing Chainlit before setup."""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import os
+import re
+import secrets
+import signal
+import socket
+import subprocess
+import sys
+from importlib.metadata import version
+from pathlib import Path
+from urllib.parse import urlsplit
+
+import yaml
+from dotenv.parser import parse_stream
+
+from .installation import ASSETS, config_directory, data_directory, runtime_workspace
+
+
+def _path(value: str | Path, relative_to: Path) -> Path:
+    path = Path(value).expanduser()
+    return (path if path.is_absolute() else relative_to / path).resolve()
+
+
+def _endpoint(value: str) -> str:
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("API base URL must be an http:// or https:// address.")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError(
+            "API base URL must not contain credentials, query or fragment."
+        )
+    return value.rstrip("/")
+
+
+def _quote(value: str) -> str:
+    if "\n" in value or "\r" in value or "\x00" in value:
+        raise ValueError("Configuration values must be single-line text.")
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _write_private(path: Path, content: str) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+        output.write(content)
+
+
+def initialize(args: argparse.Namespace) -> None:
+    directory = _path(args.config_dir or config_directory(), Path.cwd())
+    for name in (".env", "models.yaml"):
+        if (directory / name).exists():
+            raise ValueError(
+                f"Configuration already exists in {directory}. Edit it to change settings; "
+                "init never overwrites existing configuration."
+            )
+    defaults = yaml.safe_load((ASSETS / "examples/models.example.yaml").read_text())[
+        "models"
+    ][0]
+    model = args.model
+    base_url = args.base_url
+    if not args.no_input:
+        model = (
+            model
+            or input(f"Model [{defaults['model']}]: ").strip()
+            or defaults["model"]
+        )
+        base_url = (
+            base_url
+            or input("API base URL [https://openrouter.ai/api/v1]: ").strip()
+            or "https://openrouter.ai/api/v1"
+        )
+    if not model or not base_url:
+        raise ValueError("For --no-input, supply --model and --base-url.")
+    if not model.startswith("openai:") or not model.removeprefix("openai:").strip():
+        raise ValueError("Use openai:<model-id> for an OpenAI-compatible provider.")
+    base_url = _endpoint(base_url)
+    key_name = args.api_key_env
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key_name) or not key_name.endswith(
+        ("KEY", "TOKEN")
+    ):
+        raise ValueError("Choose an API-key environment name such as OPENAI_API_KEY.")
+    key = "not-required" if args.no_api_key else os.environ.get(key_name, "")
+    if not key and not args.no_input:
+        key = getpass.getpass(
+            f"API key (saved privately in {directory / '.env'}): "
+        ).strip()
+    if not key:
+        raise ValueError(
+            f"Set {key_name} or use --no-api-key for a local unauthenticated provider."
+        )
+    profile = {
+        "id": "default",
+        "label": model.removeprefix("openai:"),
+        "model": model,
+        "base_url": base_url,
+        "api_key_env": key_name,
+        "streaming": not args.no_streaming,
+    }
+    if urlsplit(base_url).hostname == "openrouter.ai":
+        profile["summary_options"] = {"extra_body": {"reasoning": {"enabled": False}}}
+    values = {
+        "APP_HOST": "127.0.0.1",
+        "APP_PORT": "8765",
+        "APP_ROOT_PATH": "",
+        "APP_DATA_DIR": str(_path(args.data_dir or data_directory(), Path.cwd())),
+        "MODEL_PROFILES_FILE": "models.yaml",
+        "CHAINLIT_AUTH_SECRET": secrets.token_urlsafe(48),
+        key_name: key,
+    }
+    environment = "# LocalChat settings. Environment variables override these values.\n"
+    environment += (
+        "# Values are literal; shell commands and substitutions are not executed.\n"
+    )
+    environment += "".join(
+        f"{name}={_quote(value)}\n" for name, value in values.items()
+    )
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _write_private(
+        directory / "models.yaml",
+        yaml.safe_dump({"models": [profile]}, sort_keys=False, allow_unicode=True),
+    )
+    try:
+        _write_private(directory / ".env", environment)
+    except BaseException:
+        (directory / "models.yaml").unlink()
+        raise
+    print(
+        f"Configuration created: {directory}\nStart the UI: localchat run --config-dir {str(directory)!r}"
+    )
+
+
+def run(args: argparse.Namespace) -> int:
+    if (
+        os.name != "posix"
+        or not hasattr(os, "O_NOFOLLOW")
+        or os.open not in os.supports_dir_fd
+    ):
+        raise ValueError(
+            "LocalChat requires POSIX dir_fd/O_NOFOLLOW support; use Linux or WSL2."
+        )
+    directory = _path(args.config_dir or config_directory(), Path.cwd())
+    env_file = directory / ".env"
+    if not env_file.is_file() and not os.environ.get("MODEL_PROFILES_FILE"):
+        raise ValueError(f"No configuration in {directory}. Run localchat init first.")
+    if env_file.is_file():
+        file_values = {}
+        with env_file.open(encoding="utf-8") as source:
+            for binding in parse_stream(source):
+                if binding.error:
+                    raise ValueError(
+                        f"Invalid .env syntax on line {binding.original.line} in {env_file}."
+                    )
+                if binding.key and binding.value is not None:
+                    file_values[binding.key] = binding.value
+        for name, value in file_values.items():
+            os.environ.setdefault(name, value)
+    os.environ["MODEL_PROFILES_FILE"] = str(
+        _path(os.environ.get("MODEL_PROFILES_FILE", "models.yaml"), directory)
+    )
+    os.environ["APP_DATA_DIR"] = str(
+        _path(
+            args.data_dir or os.environ.get("APP_DATA_DIR") or data_directory(),
+            directory,
+        )
+    )
+    host = args.host or os.environ.get("APP_HOST", "127.0.0.1")
+    try:
+        port = int(
+            args.port if args.port is not None else os.environ.get("APP_PORT", "8765")
+        )
+    except ValueError as error:
+        raise ValueError("Port must be an integer from 1 to 65535.") from error
+    if not 1 <= port <= 65535:
+        raise ValueError("Port must be an integer from 1 to 65535.")
+    prefix = (
+        args.root_path
+        if args.root_path is not None
+        else os.environ.get("APP_ROOT_PATH", "")
+    )
+    prefix = "/" + prefix.strip("/") if prefix.strip("/") else ""
+    if any(char in prefix for char in ("?", "#", "\\", "$", " ")) or any(
+        part in {".", ".."} for part in prefix.split("/")
+    ):
+        raise ValueError(
+            "Root path must be a URL path, such as /user/name/vscode/proxy/8765."
+        )
+    os.environ["APP_ROOT_PATH"] = prefix
+    secret = os.environ.get("CHAINLIT_AUTH_SECRET", "")
+    if len(secret) < 32 or secret.startswith("replace-"):
+        raise ValueError(
+            "CHAINLIT_AUTH_SECRET must contain a random secret of at least 32 characters. Run localchat init for a new configuration."
+        )
+    from .settings import load_settings
+
+    settings = load_settings()
+    for profile in settings.models:
+        if not profile.api_key or profile.api_key.startswith("replace-"):
+            raise ValueError(
+                f"Set {profile.api_key_env} for model profile {profile.id}."
+            )
+    # Detect a common startup failure before printing the UI address.
+    with socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind((host, port))
+    with runtime_workspace(settings.data_dir) as root:
+        os.environ["CHAINLIT_APP_ROOT"] = str(root)
+        os.environ["CHAINLIT_ENV_FILE"] = os.devnull
+        os.environ["CHAINLIT_HOST"] = host
+        os.environ["CHAINLIT_PORT"] = str(port)
+        os.environ["CHAINLIT_ROOT_PATH"] = prefix
+        display_host = (
+            "127.0.0.1" if host == "0.0.0.0" else (f"[{host}]" if ":" in host else host)
+        )
+        print(
+            f"LocalChat: http://{display_host}:{port}{prefix}/\nConfiguration: {directory}\nData: {settings.data_dir}\nPress Ctrl+C to stop.",
+            flush=True,
+        )
+        arguments = [
+            sys.executable,
+            "-m",
+            "chainlit",
+            "run",
+            str(Path(__file__).with_name("app.py")),
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "--root-path",
+            prefix,
+        ]
+        if not args.open_browser:
+            arguments.append("--headless")
+        # Chainlit's lifespan calls os._exit(), bypassing Python finalizers.
+        # Own its writable workspace in a parent process so cleanup still runs.
+        # A separate process group prevents Ctrl+C being delivered twice.
+        process = subprocess.Popen(arguments, start_new_session=True)
+
+        def forward_signal(signum, _frame):
+            if process.poll() is None:
+                process.send_signal(signum)
+
+        previous = {
+            signum: signal.signal(signum, forward_signal)
+            for signum in (signal.SIGINT, signal.SIGTERM)
+        }
+        try:
+            return process.wait()
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="localchat",
+        description="LocalChat: a local chat UI with a sandboxed ReAct agent.",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {version('local-agent-chat')}"
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    init = commands.add_parser(
+        "init", help="Create private model settings and a session secret."
+    )
+    init.add_argument(
+        "--config-dir", help="Configuration directory (default: user config directory)."
+    )
+    init.add_argument(
+        "--data-dir", help="Persistent data directory (default: user data directory)."
+    )
+    init.add_argument(
+        "--model", help="OpenAI-compatible identifier, e.g. openai:your-model."
+    )
+    init.add_argument(
+        "--base-url", help="Provider's API base URL, including /v1 if required."
+    )
+    init.add_argument(
+        "--api-key-env",
+        default="OPENAI_API_KEY",
+        help="Environment variable to read the API key from.",
+    )
+    init.add_argument(
+        "--no-api-key",
+        action="store_true",
+        help="Use a placeholder key for a local unauthenticated API.",
+    )
+    init.add_argument(
+        "--no-streaming", action="store_true", help="Disable streaming for this model."
+    )
+    init.add_argument(
+        "--no-input",
+        action="store_true",
+        help="Require settings through arguments/environment; never prompt.",
+    )
+    start = commands.add_parser("run", help="Start the UI using saved settings.")
+    start.add_argument(
+        "--config-dir", help="Directory containing .env and models.yaml."
+    )
+    start.add_argument("--data-dir", help="Override the persistent data directory.")
+    start.add_argument("--host", help="Listening address (default: 127.0.0.1).")
+    start.add_argument("--port", type=int, help="Listening port (default: 8765).")
+    start.add_argument(
+        "--root-path", help="Full public URL prefix when hosted behind a proxy."
+    )
+    start.add_argument(
+        "--open-browser", action="store_true", help="Open a browser on startup."
+    )
+    args = parser.parse_args(argv)
+    try:
+        status = (initialize if args.command == "init" else run)(args)
+    except (ValueError, OSError, yaml.YAMLError) as error:
+        print(f"localchat: {error}", file=sys.stderr)
+        return 2
+    except (KeyboardInterrupt, EOFError):
+        return 130
+    return status or 0

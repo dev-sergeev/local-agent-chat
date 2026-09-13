@@ -15,7 +15,7 @@ def test_run_script_loads_and_exports_dotenv_itself(tmp_path: Path) -> None:
     )
     binary_dir = tmp_path / "bin"
     binary_dir.mkdir()
-    fake_chainlit = binary_dir / "chainlit"
+    fake_chainlit = binary_dir / "python"
     fake_chainlit.write_text(
         "#!/usr/bin/env bash\n"
         'test -n "$CHAINLIT_AUTH_SECRET"\n'
@@ -44,4 +44,4 @@ def test_run_script_loads_and_exports_dotenv_itself(tmp_path: Path) -> None:
     )
     assert "--port 8765 --root-path /user/test/vscode/proxy/8765" in result.stdout
     assert "--host 127.0.0.1" in result.stdout
-    assert "--headless" in result.stdout
+    assert "-m local_agent_chat run --config-dir" in result.stdout
