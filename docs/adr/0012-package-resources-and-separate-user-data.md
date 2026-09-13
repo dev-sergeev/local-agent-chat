@@ -1,0 +1,3 @@
+# Ship immutable UI resources and keep user data outside the installation
+
+LocalChat is installed as a wheel with a Python CLI and all UI assets; configuration and durable Chat data live in explicit user directories. Chainlit requires a writable application root for temporary uploads, so a small CLI parent copies the shipped UI into a disposable workspace, starts Chainlit in a child process, forwards stop signals and holds a lock on the persistent data directory. Chainlit force-exits during shutdown, so the parent owns workspace cleanup. This costs a small asset copy at startup but keeps package upgrades independent of user data, avoids writes to site-packages, and prevents competing processes from corrupting cross-database Revision transactions.

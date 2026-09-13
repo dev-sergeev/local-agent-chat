@@ -3,9 +3,9 @@
 ## Локальный запуск
 
 ```bash
-python -m pip install -e '.[test]'
-cp models.example.yaml models.yaml
-cp .env.example .env
+python -m pip install -e '.[test]' build twine
+localchat init --config-dir . --data-dir .local-agent-chat
+localchat run --config-dir .
 ```
 
 Не используйте реальные секреты в тестах. Проверяйте запрет выхода из песочницы на файлах, созданных через `tmp_path`; тест не должен читать настоящие системные или пользовательские файлы.
@@ -16,8 +16,11 @@ cp .env.example .env
 pytest -q
 ruff check .
 ruff format --check .
-python -m compileall -q local_agent_chat app.py
+python -m compileall -q local_agent_chat
 bash -n scripts/run.sh
+python -m build
+python -m twine check dist/*
+python scripts/check_distribution.py dist/*.whl
 ```
 
 - Добавьте тест для изменённого поведения.
@@ -27,3 +30,5 @@ bash -n scripts/run.sh
 - Не коммитьте `.env`, `models.yaml`, `.local-agent-chat/`, SQLite, скриншоты и логи.
 
 Карта файлов и точек настройки есть в README.
+
+Проверка дистрибутива создаёт чистое окружение вне checkout, устанавливает только runtime-зависимости и проверяет UI, загрузку файла, вызов инструмента, правку исторического запроса и восстановление после переустановки через локальную тестовую модель. Ресурсы UI находятся в `local_agent_chat/assets/`; CLI копирует их в отдельный временный каталог при запуске.

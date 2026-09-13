@@ -235,7 +235,7 @@ memory_sources
 5. vector embeddings этих documents/memories;
 6. существующие checkpoints, Sandbox и UI history.
 
-Текущий `cleanup_chat` уже координирует checkpoint, Sandbox и runtime history; global memory adapter должен войти в тот же lifecycle. [`app.py`](../../app.py)
+Текущий `cleanup_chat` уже координирует checkpoint, Sandbox и runtime history; global memory adapter должен войти в тот же lifecycle. [`app.py`](../../local_agent_chat/app.py)
 
 ### Явное «забудь это»
 

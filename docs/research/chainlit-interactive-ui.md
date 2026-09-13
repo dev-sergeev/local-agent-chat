@@ -14,15 +14,15 @@ Chainlit 2.11.1 уже содержит почти весь набор, нужн
 
 Использованы только первичные источники: официальная документация Chainlit, официальный репозиторий `Chainlit/chainlit`, его исходный код, changelog и releases. Полный официальный индекс документации находится в [`llms.txt`](https://docs.chainlit.io/llms.txt).
 
-В репозитории нет отдельной конвенции для research notes: `docs/` содержит архитектуру и ADR, а корневой [`chainlit.md`](../../chainlit.md) является пользовательской welcome/readme-страницей Chainlit. Поэтому отчёт размещён в `docs/research/`.
+В репозитории нет отдельной конвенции для research notes: `docs/` содержит архитектуру и ADR, а корневой [`chainlit.md`](../../local_agent_chat/assets/chainlit.md) является пользовательской welcome/readme-страницей Chainlit. Поэтому отчёт размещён в `docs/research/`.
 
 Локальная реализация сегодня:
 
-- Использует штатный Web App и lifecycle hooks `on_chat_start`, `on_chat_resume`, `on_message`; Model Profile выбирается через `set_chat_profiles`. [`app.py`](../../app.py)
+- Использует штатный Web App и lifecycle hooks `on_chat_start`, `on_chat_resume`, `on_message`; Model Profile выбирается через `set_chat_profiles`. [`app.py`](../../local_agent_chat/app.py)
 - Имеет локальный SQLAlchemy/SQLite data layer, схему для threads, steps, elements и feedback, плюс собственный журнал Revision. [`local_agent_chat/chainlit_data.py`](../../local_agent_chat/chainlit_data.py)
-- Загружает файлы из `message.elements` в отдельный Sandbox и прикладывает изменённые агентом файлы как `cl.File(display="side")`. [`app.py`](../../app.py)
-- Сейчас ждёт полный `answer` от runtime и только затем отправляет одно сообщение, то есть визуального token streaming нет. [`app.py`](../../app.py), [`local_agent_chat/runtime.py`](../../local_agent_chat/runtime.py)
-- Разрешает `*/*`, до 20 файлов и 100 MiB на файл, оставляет audio/MCP выключенными, CoT — `full`, message editing — включённым, `unsafe_allow_html` — выключенным; `allow_origins=["*"]`. [`.chainlit/config.toml`](../../.chainlit/config.toml)
+- Загружает файлы из `message.elements` в отдельный Sandbox и прикладывает изменённые агентом файлы как `cl.File(display="side")`. [`app.py`](../../local_agent_chat/app.py)
+- Сейчас ждёт полный `answer` от runtime и только затем отправляет одно сообщение, то есть визуального token streaming нет. [`app.py`](../../local_agent_chat/app.py), [`local_agent_chat/runtime.py`](../../local_agent_chat/runtime.py)
+- Разрешает `*/*`, до 20 файлов и 100 MiB на файл, оставляет audio/MCP выключенными, CoT — `full`, message editing — включённым, `unsafe_allow_html` — выключенным; `allow_origins=["*"]`. [`.chainlit/config.toml`](../../local_agent_chat/assets/chainlit/config.toml)
 
 ## 1. Архитектура Chainlit
 
@@ -48,7 +48,7 @@ Chainlit — монорепозиторий из Python/FastAPI backend, React f
 
 Для проекта:
 
-- Сохранять `model_profile` в metadata thread, как сейчас, правильно: profile должен восстанавливаться независимо от WebSocket session. [`app.py`](../../app.py)
+- Сохранять `model_profile` в metadata thread, как сейчас, правильно: profile должен восстанавливаться независимо от WebSocket session. [`app.py`](../../local_agent_chat/app.py)
 - `on_stop` следует связать с отменой agent task и безопасной фиксацией статуса Turn; нативная кнопка Stop и hook предусмотрены lifecycle. [Chat lifecycle: On Stop](https://docs.chainlit.io/concepts/chat-lifecycle#on-stop).
 - Инициализация в `on_chat_start` должна оставаться идемпотентной, а фактической границей данных должен быть `thread_id`, не socket/session id. [Lifecycle](https://docs.chainlit.io/concepts/chat-lifecycle), [Chat History](https://docs.chainlit.io/data-persistence/history).
 
@@ -133,7 +133,7 @@ Commands позволяют выбрать named tool/mode возле composer, 
 
 Chainlit app публичен по умолчанию. Для приватности требуются `CHAINLIT_AUTH_SECRET` и password, OAuth или header callback; identifier каждого пользователя должен быть уникальным, иначе данные могут смешаться. [Authentication overview](https://docs.chainlit.io/authentication/overview).
 
-Header auth предназначен для делегирования проверки reverse proxy, но callback приложения всё равно отвечает за фактическую валидацию header и должен вернуть `User` или `None`. [Header authentication](https://docs.chainlit.io/authentication/header). Текущий callback всегда возвращает одного `local-user`, поэтому безопасность целиком опирается на JupyterHub/proxy boundary. [`app.py`](../../app.py)
+Header auth предназначен для делегирования проверки reverse proxy, но callback приложения всё равно отвечает за фактическую валидацию header и должен вернуть `User` или `None`. [Header authentication](https://docs.chainlit.io/authentication/header). Текущий callback всегда возвращает одного `local-user`, поэтому безопасность целиком опирается на JupyterHub/proxy boundary. [`app.py`](../../local_agent_chat/app.py)
 
 По умолчанию chats/elements не сохраняются; persistence подключается data layer. [Persistence overview](https://docs.chainlit.io/data-persistence/overview). Официальный SQLAlchemy layer тестируется с PostgreSQL и поддерживает blob clients для Azure/S3; его schema включает users, threads, steps, elements и feedback. [SQLAlchemy data layer](https://docs.chainlit.io/data-layers/sqlalchemy).
 
@@ -150,7 +150,7 @@ History с поиском, resume и thread list появляется тольк
 
 Chainlit stream-ит и Message, и Step. Базовый protocol: создать пустой message/step, вызывать `stream_token()` для чанков, затем `update()`; интеграции могут предоставить streaming через callback handler. [Streaming](https://docs.chainlit.io/advanced-features/streaming), [Message API](https://docs.chainlit.io/api-reference/message).
 
-Главный UX-дефицит текущего приложения — `Agent.run()` возвращает готовую строку, а `app.py` отправляет её только после завершения. [`runtime.py`](../../local_agent_chat/runtime.py), [`app.py`](../../app.py). Рекомендуемая граница:
+Главный UX-дефицит текущего приложения — `Agent.run()` возвращает готовую строку, а `app.py` отправляет её только после завершения. [`runtime.py`](../../local_agent_chat/runtime.py), [`app.py`](../../local_agent_chat/app.py). Рекомендуемая граница:
 
 ```text
 agent event stream

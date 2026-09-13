@@ -6,30 +6,57 @@
 
 Редактирование исторического запроса удаляет его прежний ответ и последующее продолжение. Контекст вместе со сводкой и файлами восстанавливается перед изменяемым запросом, после чего агент отвечает заново. Ошибка или Stop восстанавливают прежнее состояние. Одинаковый текст правки сохраняет весь диалог.
 
-## Запуск
+## Установка и первый запуск
 
-Требуются Python 3.12–3.13 и OpenAI-compatible модель с tool calling.
+Требуются Python **3.12–3.13**, Linux (или WSL2) и OpenAI-compatible модель с tool calling. Пакет содержит UI, переводы и все ресурсы приложения; клонировать репозиторий для запуска не нужно. Windows без WSL не поддерживается из-за требований файловой песочницы. macOS пока не входит в проверяемые платформы.
 
-```bash
-python -m pip install -e '.[test]'
-cp models.example.yaml models.yaml
-cp .env.example .env
-# Укажите ключ модели и случайный CHAINLIT_AUTH_SECRET в .env.
-./scripts/run.sh
-```
-
-Обычный адрес — `http://127.0.0.1:8765/`. В JupyterHub задайте в `.env` полный публичный префикс:
+После публикации в PyPI установите приложение через [pipx](https://pipx.pypa.io/stable/installation/):
 
 ```bash
-APP_PORT=8765
-APP_ROOT_PATH="${JUPYTERHUB_SERVICE_PREFIX%/}/vscode/proxy/$APP_PORT"
+pipx install --python python3.12 local-agent-chat
+localchat init
+localchat run
 ```
 
-`run.sh` сам читает `.env` как shell-файл и разворачивает переменные. Пустой префикс при открытии через прокси приводит к неверным адресам JavaScript и белому экрану. Проверяйте UI именно по публичному пути.
+`init` запросит модель, адрес API и ключ. Для OpenAI-compatible endpoint имя модели имеет вид `openai:<model-id>`, например `openai:deepseek/deepseek-v4-flash-0731` для OpenRouter. Ключ вводится без отображения в терминале; секрет сессии создаётся автоматически. `run` покажет адрес UI, по умолчанию **http://127.0.0.1:8765/**. Остановка — `Ctrl+C`; `--open-browser` открывает браузер автоматически.
 
-Модели задаются в `models.yaml`, ключи — в environment. Для модели без streaming укажите `streaming: false`. Поддерживается запуск из checkout: нужны `app.py`, `.chainlit/`, `public/` и `scripts/`; wheel отдельно от этих файлов не является автономным приложением.
+До первого релиза можно установить собранный wheel: `pipx install --python python3.12 ./dist/local_agent_chat-0.1.0-py3-none-any.whl`. Альтернатива pipx — `python3.12 -m venv .venv`, активация окружения и `python -m pip install local-agent-chat`.
 
-Инструменты песочницы требуют POSIX-систему с `dir_fd` и `O_NOFOLLOW` (проверено на Linux).
+Для локального API без ключа:
+
+```bash
+localchat init --no-input --model openai:your-model \
+  --base-url http://127.0.0.1:8000/v1 --no-api-key
+```
+
+Для автоматической настройки с ключом передайте его в `OPENAI_API_KEY` и используйте те же аргументы без `--no-api-key`. `--api-key-env MY_PROVIDER_KEY` выбирает другое имя переменной; `--no-streaming` отключает потоковый ответ. Полная справка: `localchat init --help`, `localchat run --help`.
+
+## Настройки, данные и обновление
+
+На Linux по умолчанию используются:
+
+- `~/.config/localchat/.env` — параметры запуска и ключи, права нового файла `0600`.
+- `~/.config/localchat/models.yaml` — профили моделей; ключи здесь не хранятся.
+- `~/.local/share/localchat/` — SQLite, история и вложения.
+
+Учитываются `XDG_CONFIG_HOME` и `XDG_DATA_HOME`. `--config-dir PATH` или `LOCALCHAT_CONFIG_DIR` выбирает другой каталог конфигурации, `--data-dir PATH` — каталог данных. Относительные пути из `.env` разрешаются относительно каталога конфигурации. Приоритет: аргументы запуска, затем переменные окружения, затем `.env`, затем значения по умолчанию. `.env` читается как данные: shell-команды и подстановки `${...}` не выполняются.
+
+Повторный `init` не перезаписывает настройки. Для смены модели или ключа отредактируйте конфигурацию и перезапустите приложение. Обновление: `pipx upgrade local-agent-chat`; перед обновлением остановите процесс и сделайте резервную копию каталогов конфигурации и данных. Установка и переустановка пакета их не затрагивают. Два процесса не могут одновременно открыть один каталог данных.
+
+Если запуск сообщает об отсутствующей конфигурации, выполните `localchat init`. Для занятого порта используйте `localchat run --port 8766`. Ошибки модели отображаются в UI и терминале; используйте endpoint с поддержкой tool calling и бюджетом контекста, подходящим выбранной модели.
+
+## JupyterHub и существующая установка
+
+Для прокси задайте **полный публичный префикс**:
+
+```bash
+localchat run --port 8765 \
+  --root-path "${JUPYTERHUB_SERVICE_PREFIX%/}/vscode/proxy/8765"
+```
+
+Здесь переменную раскрывает shell перед вызовом команды. В `.env` нужно записать уже готовый путь, например `/user/alice/vscode/proxy/8765`. Неверный префикс может привести к белому экрану из-за неправильных адресов JavaScript. Проверяйте UI по публичному адресу прокси. Прямой порт рассчитан на локальное использование; внешний доступ требует аутентификации прокси, см. [Security](SECURITY.md).
+
+Старые `.env`, `models.yaml` и каталог данных можно использовать через `localchat run --config-dir /path/to/checkout`. Сценарий `./scripts/run.sh` сохранён для существующих checkout и по-прежнему обрабатывает `.env` как shell-файл, включая прежние подстановки переменных. В новых установках используйте команды `localchat`. Запуск из исходников и проверки описаны в [Contributing](CONTRIBUTING.md), выпуск — в [инструкции публикации](docs/publishing.md).
 
 ## Контекст и лимиты
 
@@ -77,6 +104,6 @@ UI принимает до 20 файлов по 100 MiB; объём активн
 | Четыре инструмента чтения | `local_agent_chat/sandbox_tools.py` |
 | System prompt и заголовки | `local_agent_chat/prompts.py` |
 | Настройки и provider retry | `local_agent_chat/settings.py`, `local_agent_chat/llm_retry.py` |
-| Координация истории и UI | `local_agent_chat/runtime.py`, `local_agent_chat/chainlit_data.py`, `app.py` |
+| Координация истории и UI | `local_agent_chat/runtime.py`, `local_agent_chat/chainlit_data.py`, `local_agent_chat/app.py` |
 
 [Архитектура](docs/architecture.md), [термины](CONTEXT.md), [ограничения доступа](SECURITY.md), [разработка](CONTRIBUTING.md), [результаты проверок](docs/react-validation.md).

@@ -43,7 +43,7 @@
 - явный running/error/cancelled status;
 - связь созданного файла с породившим его шагом.
 
-Настройка `cot = "full"` в [`.chainlit/config.toml`](../../.chainlit/config.toml) сама по себе ничего не добавляет: Chainlit может отобразить только те `Step`, которые создаёт приложение или callback handler.
+Настройка `cot = "full"` в [`.chainlit/config.toml`](../../local_agent_chat/assets/chainlit/config.toml) сама по себе ничего не добавляет: Chainlit может отобразить только те `Step`, которые создаёт приложение или callback handler.
 
 ## Разобранные реализации
 

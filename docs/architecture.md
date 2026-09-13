@@ -4,7 +4,7 @@ LocalChat consists of Chainlit and one LangChain `create_agent` ReAct loop. See 
 
 | Module | Responsibility |
 |---|---|
-| `app.py` | Compose dependencies; handle Chainlit start/resume/message/edit/Stop; publish titles |
+| `local_agent_chat/app.py` | Compose dependencies; handle Chainlit start/resume/message/edit/Stop; publish titles |
 | `agent_execution.py` | Load messages, run model/tools, translate events, save successful context |
 | `agent_context.py` | Rolling summaries, input budget, isolated model retries |
 | `agent_memory.py` | Current messages and immutable pre-Turn context snapshots in SQLite |
@@ -50,6 +50,12 @@ Old binding tables migrate only their Chat/model mapping; capability modes and b
 
 For a legacy checkpoint token, the runtime history locates the corresponding active Turn and imports only earlier pairs. New checkpoints always capture the actual compacted context. A missing or foreign checkpoint is an error. Old internal LangGraph tables and Markdown memory may remain on disk, but are neither loaded nor used by the new execution path. The retired derived cross-Chat search index is removed; canonical Turn history is preserved.
 
+## Installed application
+
+`cli.py` implements `localchat init/run` without importing Chainlit before paths and environment are ready. Configuration defaults to the OS user config directory; persistent SQLite and uploads default to the user data directory. Explicit command arguments override environment variables, which override literal `.env` values. Relative configured paths are anchored to the config directory. Init creates private files exclusively, generates a session secret and never overwrites existing settings.
+
+`installation.py` owns the installed resource layout and process lock. The wheel includes UI assets, translations, templates and the application module. Each start copies resources to a fresh writable workspace under the data directory and sets `CHAINLIT_APP_ROOT` before importing Chainlit. The CLI supervises a child Chainlit process and forwards SIGINT/SIGTERM once. This keeps cleanup outside Chainlit's `os._exit()` shutdown path; application resources close before the Chainlit lifespan exits, and the parent removes the workspace while durable data stays in place. No runtime writes target site-packages or the caller's working directory. See [ADR 0012](adr/0012-package-resources-and-separate-user-data.md).
+
 ## Hosting
 
-`run.sh` reads `.env` and passes `APP_ROOT_PATH` to Chainlit. Under JupyterHub the prefix is the full public route, including `/user/.../vscode/proxy/<port>`. The narrow ASGI adapter restores a prefix stripped by the proxy. DELETE bodies use the existing proxy-compatible POST override. Validate UI assets and WebSocket history through that public route, not only a direct local port.
+`localchat run` passes the configured root path to Chainlit. The legacy `run.sh` remains a shell-based adapter for existing checkout configurations. Under JupyterHub the prefix is the full public route, including `/user/.../vscode/proxy/<port>`. The narrow ASGI adapter restores a prefix stripped by the proxy. DELETE bodies use the existing proxy-compatible POST override. Validate UI assets and WebSocket history through that public route, not only a direct local port.
