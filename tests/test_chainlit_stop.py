@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+
 import chainlit.socket as chainlit_socket
 import pytest
 from chainlit.config import config
@@ -44,6 +47,9 @@ async def test_stop_keeps_cancellation_and_callback_without_english_message(
             sent_messages.append(self.content)
 
     class FakeTask:
+        def cancelling(self) -> int:
+            return int(self in cancelled_tasks)
+
         def cancel(self) -> None:
             cancelled_tasks.append(self)
 
@@ -100,3 +106,33 @@ def test_stop_adapter_rejects_an_unknown_chainlit_signature(
 
     with pytest.raises(RuntimeError, match="Unsupported Chainlit stop signature"):
         chainlit_stop.install_localized_stop_compatibility()
+
+
+async def test_repeated_stop_does_not_interrupt_turn_cleanup(monkeypatch):
+    started, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def turn():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleaning.set()
+            await release.wait()
+
+    task = asyncio.create_task(turn())
+    session = SimpleNamespace(current_task=task)
+    monkeypatch.setitem(sio.handlers["/"], "stop", chainlit_socket.stop)
+    monkeypatch.setattr(chainlit_socket.WebsocketSession, "get", lambda _sid: session)
+    monkeypatch.setattr(chainlit_socket, "init_ws_context", lambda _s: None)
+    monkeypatch.setattr(config.code, "on_stop", None)
+    chainlit_stop.install_localized_stop_compatibility()
+    stop = sio.handlers["/"]["stop"]
+    try:
+        await started.wait()
+        await stop("socket")
+        await cleaning.wait()
+        await stop("socket")
+        assert task.cancelling() == 1
+    finally:
+        release.set()
+        await task

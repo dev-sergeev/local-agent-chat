@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable
 from contextlib import asynccontextmanager
 from hashlib import sha256
@@ -18,6 +19,11 @@ from local_agent_chat.agent_events import safe_text
 from local_agent_chat.agent_execution import AgentExecution
 from local_agent_chat.auxiliary_labels import AuxiliaryLabels
 from local_agent_chat.chainlit_data import create_chainlit_data_layer
+from local_agent_chat.chainlit_persistence import step_writes
+from local_agent_chat.chainlit_revision import (
+    install_revision_handler,
+    sync_chat_history,
+)
 from local_agent_chat.chainlit_stop import install_localized_stop_compatibility
 from local_agent_chat.chainlit_ui import ChainlitTurnView
 from local_agent_chat.chainlit_uploads import (
@@ -96,7 +102,6 @@ runtime = ChatRuntime(
     sandbox=sandbox_files,
     history=runtime_history,
 )
-active_views: dict[str, ChainlitTurnView] = {}
 chat_title_tasks: dict[str, asyncio.Task[None]] = {}
 chat_turn_locks: dict[str, asyncio.Lock] = {}
 deleting_chats: set[str] = set()
@@ -305,7 +310,9 @@ async def _run_turn(view: ChainlitTurnView, operation: Awaitable[str]) -> str:
         await asyncio.shield(view.cancel())
         raise
     except Exception as error:  # noqa: BLE001 - provider/tool failures end the Turn
-        await view.fail(safe_text(error, max_chars=2000))
+        detail = safe_text(error, max_chars=2000)
+        logging.getLogger(__name__).warning("Agent request failed: %s", detail)
+        await view.fail(detail)
         raise _TurnRunFailed from error
 
 
@@ -353,7 +360,6 @@ async def _handle_message(message: cl.Message, chat_id: str) -> None:
     view = ChainlitTurnView(
         detailed_tools=bool(cl.user_session.get("show_tool_details", False)),
     )
-    active_views[chat_id] = view
     try:
         if is_revision:
             async with runtime.revision_transaction(
@@ -364,20 +370,25 @@ async def _handle_message(message: cl.Message, chat_id: str) -> None:
                 before_run=upload_message_files if uploads else None,
             ) as run_revision:
                 async with chainlit_layer.revision(message.id):
+                    await sync_chat_history(chainlit_layer)
                     await view.start()
                     answer = await _run_turn(view, run_revision())
                     await view.complete(answer)
         else:
-            await view.start()
-            answer = await _run_turn(
-                view,
-                runtime.submit(chat_id, message.id, message.content, view.handle),
-            )
-            await view.complete(answer)
+            async with step_writes():
+                await view.start()
+                answer = await _run_turn(
+                    view,
+                    runtime.submit(chat_id, message.id, message.content, view.handle),
+                )
+                await view.complete(answer)
     except _TurnRunFailed:
+        if is_revision:
+            await cl.context.emitter.send_toast(
+                "Не удалось изменить сообщение. Предыдущая история восстановлена.",
+                "error",
+            )
         return
-    finally:
-        active_views.pop(chat_id, None)
 
 
 @cl.on_message
@@ -391,15 +402,48 @@ async def on_message(message: cl.Message):
         await _handle_message(message, chat_id)
 
 
-@cl.on_stop
-async def on_stop():
+async def on_edit_message(payload: dict) -> None:
     chat_id = _thread_id()
-    view = active_views.get(chat_id)
-    if view is not None:
+    async with chat_turn_locks.setdefault(chat_id, asyncio.Lock()):
+        if chat_id in deleting_chats:
+            return
         try:
-            await view.cancel()
-        except RuntimeError:
-            pass
+            edited = payload.get("message", {}) if isinstance(payload, dict) else {}
+            if not isinstance(edited, dict) or not isinstance(
+                edited.get("output"), str
+            ):
+                raise ValueError("Invalid edited message")
+            original = await chainlit_layer.get_step(edited.get("id"))
+            if (
+                original is None
+                or original["threadId"] != chat_id
+                or original["type"] != "user_message"
+            ):
+                raise ValueError("Edited message does not belong to this Chat")
+            if original["output"] == edited["output"]:
+                return
+            if not await runtime.has_turn(original["id"]):
+                await cl.context.emitter.send_toast(
+                    "У этого сообщения нет сохранённого состояния для изменения. "
+                    "Отправьте исправленный текст новым сообщением.",
+                    "error",
+                )
+                return
+            # Stage and persist before removing anything. Chainlit's default
+            # editor schedules update/delete tasks concurrently and cannot
+            # coordinate their outcome with the runtime Revision transaction.
+            message = cl.Message.from_dict({**original, "output": edited["output"]})
+            await chainlit_layer.update_step(message.to_dict())
+            try:
+                await _handle_message(message, chat_id)
+            except BaseException:
+                await asyncio.shield(chainlit_layer._restore_revision(message.id))
+                raise
+        finally:
+            await asyncio.shield(sync_chat_history(chainlit_layer))
+
+
+install_revision_handler(chainlit_layer, on_edit_message)
 
 
 @router.get("/files/{object_key:path}", include_in_schema=False)

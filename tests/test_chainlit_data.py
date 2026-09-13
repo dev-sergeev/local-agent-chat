@@ -44,6 +44,35 @@ async def _persist_file_element(
 
 
 @pytest.mark.asyncio
+async def test_revision_serializes_message_modes_and_tags(tmp_path: Path) -> None:
+    layer = create_chainlit_data_layer(tmp_path / "chainlit.sqlite3")
+    step = {
+        "id": "user-1",
+        "threadId": "chat-1",
+        "type": "user_message",
+        "name": "user",
+        "output": "original",
+        "createdAt": "2026-09-12T00:00:00Z",
+    }
+    try:
+        await layer.create_step.__wrapped__(layer, step)
+        await layer.update_step(
+            {**step, "output": "revised", "modes": [], "tags": ["test"]}
+        )
+        async with layer.revision("user-1"):
+            pass
+        thread = await layer.get_thread("chat-1")
+        assert thread["steps"][0]["output"] == "revised"
+        with sqlite3.connect(tmp_path / "chainlit.sqlite3") as connection:
+            assert connection.execute("SELECT modes, tags FROM steps").fetchone() == (
+                "[]",
+                '["test"]',
+            )
+    finally:
+        await layer.close()
+
+
+@pytest.mark.asyncio
 async def test_existing_chainlit_database_is_migrated_for_current_step_fields(
     tmp_path: Path,
 ) -> None:
@@ -742,3 +771,35 @@ async def test_revision_exception_restores_the_first_complete_snapshot(
     assert storage.path_for(original_element["objectKey"]).read_bytes() == b"old blob"
     assert not storage.path_for(tentative_object_key).exists()
     await layer.close()
+
+
+@pytest.mark.parametrize("abort", [False, True])
+async def test_revision_uses_persisted_order_when_timestamps_are_equal(tmp_path, abort):
+    layer = create_chainlit_data_layer(tmp_path / "same-time.sqlite3")
+    ids = ["z-first", "m-second", "a-third"]
+    records = [
+        dict(
+            id=i,
+            threadId="chat",
+            type="user_message",
+            name="user",
+            output=i,
+            createdAt="2026-01-01T00:00:00Z",
+        )
+        for i in ids
+    ]
+    try:
+        for record in records:
+            await layer.create_step.__wrapped__(layer, record)
+        await layer.update_step({**records[1], "output": "changed"})
+        try:
+            async with layer.revision(ids[1]):
+                if abort:
+                    raise RuntimeError("rollback")
+        except RuntimeError:
+            if not abort:
+                raise
+        actual = [s["output"] for s in (await layer.get_thread("chat"))["steps"]]
+        assert actual == (ids if abort else [ids[0], "changed"])
+    finally:
+        await layer.close()

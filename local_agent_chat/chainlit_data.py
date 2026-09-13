@@ -5,7 +5,7 @@ import json
 import logging
 import sqlite3
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from pathlib import Path
 
 from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
@@ -14,6 +14,7 @@ from chainlit.data.utils import queue_until_user_message
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .chainlit_persistence import step_writes, track_step_write
 from .chat_titles import (
     CHAT_TITLE_FALLBACK,
     CHAT_TITLE_GENERATED,
@@ -50,6 +51,7 @@ STEP_COLUMNS = [
     "modes",
     "defaultOpen",
     "autoCollapse",
+    "stepOrder",
 ]
 
 ELEMENT_COLUMNS = [
@@ -164,7 +166,7 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
         rows = await self.execute_sql(
             query="""SELECT id, output FROM steps
                 WHERE "threadId" = :thread_id AND type = 'user_message'
-                ORDER BY "createdAt" ASC LIMIT 1""",
+                ORDER BY "stepOrder" ASC LIMIT 1""",
             parameters={"thread_id": thread_id},
         )
         if not isinstance(rows, list) or not rows:
@@ -237,15 +239,25 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
                 self._initial_name_events.setdefault(thread_id, asyncio.Event()).set()
 
     @queue_until_user_message()
+    @track_step_write
     async def create_step(self, step_dict):
         async with self._step_lock(step_dict["id"]):
-            await SQLAlchemyDataLayer.create_step.__wrapped__(self, step_dict)
+            await self.update_thread(step_dict["threadId"])
+            async with self.async_session() as session:
+                async with session.begin():
+                    await self._upsert_step(session, step_dict)
 
     async def get_all_user_threads(self, user_id=None, thread_id=None):
         threads = await super().get_all_user_threads(
             user_id=user_id, thread_id=thread_id
         )
         for thread in threads or []:
+            order_rows = await self.execute_sql(
+                query='SELECT id, "stepOrder" FROM steps WHERE "threadId"=:thread_id',
+                parameters={"thread_id": thread["id"]},
+            )
+            order = {row["id"]: row["stepOrder"] for row in order_rows}
+            thread["steps"].sort(key=lambda step: order[step["id"]])
             for key in ("metadata", "tags"):
                 if isinstance(thread.get(key), str):
                     thread[key] = json.loads(thread[key])
@@ -264,6 +276,7 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
                     step["metadata"] = metadata
         return threads
 
+    @track_step_write
     async def update_step(self, step_dict):
         async with self._step_lock(step_dict["id"]):
             await self.update_thread(step_dict["threadId"])
@@ -281,6 +294,7 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
     @staticmethod
     async def _upsert_step(session: AsyncSession, step_dict: dict) -> None:
         record = dict(step_dict)
+        record.pop("stepOrder", None)
         record["showInput"] = (
             str(record.get("showInput", "")).lower() if "showInput" in record else None
         )
@@ -289,15 +303,20 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
             for key, value in record.items()
             if value is not None and not (isinstance(value, dict) and not value)
         }
-        parameters["metadata"] = json.dumps(record.get("metadata", {}))
-        parameters["generation"] = json.dumps(record.get("generation", {}))
+        for key in ("metadata", "generation", "tags", "modes"):
+            value = record.get(key, {} if key in {"metadata", "generation"} else None)
+            if value is not None:
+                parameters[key] = value if isinstance(value, str) else json.dumps(value)
         columns = ", ".join(f'"{key}"' for key in parameters)
         values = ", ".join(f":{key}" for key in parameters)
         updates = ", ".join(f'"{key}" = :{key}' for key in parameters if key != "id")
         await session.execute(
             text(
-                f"""INSERT INTO steps ({columns})
-                    VALUES ({values})
+                f"""INSERT INTO steps ({columns}, "stepOrder")
+                    VALUES ({values}, COALESCE(
+                        (SELECT "stepOrder" FROM steps WHERE id=:id),
+                        (SELECT COALESCE(MAX("stepOrder"), 0) + 1 FROM steps WHERE "threadId"=:threadId)
+                    ))
                     ON CONFLICT (id) DO UPDATE SET {updates}"""
             ),
             parameters,
@@ -317,7 +336,11 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
         parameters = {
             "root_id": root_id,
             "thread_id": existing["threadId"],
-            "created_at": existing["createdAt"],
+            "step_order": (
+                await session.execute(
+                    text('SELECT "stepOrder" FROM steps WHERE id=:id'), {"id": root_id}
+                )
+            ).scalar_one(),
             "archive_version": REVISION_ARCHIVE_VERSION,
         }
         step_names = ", ".join(f'"{name}"' for name in STEP_COLUMNS)
@@ -330,7 +353,7 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
                            :archive_version
                     FROM steps s
                     WHERE s."threadId" = :thread_id
-                      AND s."createdAt" >= :created_at"""
+                      AND s."stepOrder" >= :step_order"""
             ),
             parameters,
         )
@@ -374,7 +397,8 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
         await self._wait_for_revision(root_id)
         try:
             await self._truncate_revision(root_id)
-            yield
+            async with step_writes():
+                yield
         except BaseException:
             await asyncio.shield(self._restore_revision(root_id))
             raise
@@ -405,7 +429,7 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
     async def _revision_root(session: AsyncSession, root_id: str):
         result = await session.execute(
             text(
-                """SELECT "threadId", "createdAt", "archiveVersion"
+                """SELECT "threadId", "stepOrder", "archiveVersion"
                    FROM step_revisions
                    WHERE "rootId" = :root_id AND id = :root_id"""
             ),
@@ -424,11 +448,11 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
                 root = await self._revision_root(session, root_id)
                 parameters = {
                     "thread_id": root["threadId"],
-                    "created_at": root["createdAt"],
+                    "step_order": root["stepOrder"],
                 }
                 descendant_ids = """SELECT id FROM steps
                     WHERE "threadId" = :thread_id
-                      AND "createdAt" > :created_at"""
+                      AND "stepOrder" > :step_order"""
                 await session.execute(
                     text(f'DELETE FROM feedbacks WHERE "forId" IN ({descendant_ids})'),
                     parameters,
@@ -440,7 +464,7 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
                 await session.execute(
                     text(
                         'DELETE FROM steps WHERE "threadId" = :thread_id '
-                        'AND "createdAt" > :created_at'
+                        'AND "stepOrder" > :step_order'
                     ),
                     parameters,
                 )
@@ -479,7 +503,7 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
                     text(
                         """SELECT * FROM step_revisions
                            WHERE "rootId" = :root_id
-                           ORDER BY "createdAt", id"""
+                           ORDER BY "stepOrder" ASC"""
                     ),
                     {"root_id": root_id},
                 )
@@ -492,12 +516,12 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
                 version = int(root.get("archiveVersion") or 1)
                 parameters = {
                     "thread_id": root["threadId"],
-                    "created_at": root["createdAt"],
+                    "step_order": root["stepOrder"],
                     "root_id": root_id,
                 }
                 continuation_ids = """SELECT id FROM steps
                     WHERE "threadId" = :thread_id
-                      AND "createdAt" >= :created_at"""
+                      AND "stepOrder" >= :step_order"""
 
                 element_rows = []
                 feedback_rows = []
@@ -545,7 +569,7 @@ class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
                 await session.execute(
                     text(
                         'DELETE FROM steps WHERE "threadId" = :thread_id '
-                        'AND "createdAt" >= :created_at'
+                        'AND "stepOrder" >= :step_order'
                     ),
                     parameters,
                 )
@@ -700,6 +724,20 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
                 connection.execute(
                     f'ALTER TABLE "{table}" ADD COLUMN "{column}" INTEGER DEFAULT 0'
                 )
+    for table in ("steps", "step_revisions"):
+        columns = {
+            row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')
+        }
+        if "stepOrder" not in columns:
+            connection.execute(f'ALTER TABLE "{table}" ADD COLUMN "stepOrder" INTEGER')
+            # Existing rows retain their chronological order and original tie order.
+            connection.execute(f'''WITH ordered AS (
+                SELECT rowid AS rid, ROW_NUMBER() OVER (
+                    PARTITION BY "threadId" ORDER BY "createdAt", rowid
+                ) AS position FROM "{table}"
+            ) UPDATE "{table}" SET "stepOrder"=(
+                SELECT position FROM ordered WHERE rid="{table}".rowid
+            )''')
     revision_columns = {
         row[1] for row in connection.execute('PRAGMA table_info("step_revisions")')
     }
@@ -718,7 +756,7 @@ def create_chainlit_data_layer(
     path: Path, storage: BaseStorageClient | None = None
 ) -> SQLiteChainlitDataLayer:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.executescript(SCHEMA)
         _migrate_schema(connection)
     return SQLiteChainlitDataLayer(

@@ -28,7 +28,9 @@ def install_localized_stop_compatibility() -> None:
         if session := chainlit_socket.WebsocketSession.get(sid):
             chainlit_socket.init_ws_context(session)
 
-            if session.current_task:
+            # One cancellation lets the Turn finish its rollback. A repeated
+            # Stop must not interrupt cleanup and leave shielded writes behind.
+            if session.current_task and not session.current_task.cancelling():
                 session.current_task.cancel()
 
             if config.code.on_stop:
