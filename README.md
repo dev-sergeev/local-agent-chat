@@ -54,9 +54,9 @@ localchat run --port 8765 \
   --root-path "${JUPYTERHUB_SERVICE_PREFIX%/}/vscode/proxy/8765"
 ```
 
-Здесь переменную раскрывает shell перед вызовом команды. В `.env` нужно записать уже готовый путь, например `/user/alice/vscode/proxy/8765`. Неверный префикс может привести к белому экрану из-за неправильных адресов JavaScript. Проверяйте UI по публичному адресу прокси. Прямой порт рассчитан на локальное использование; внешний доступ требует аутентификации прокси, см. [Security](SECURITY.md).
+Здесь переменную раскрывает shell перед вызовом команды. В `.env` нужно записать уже готовый путь, например `/user/alice/vscode/proxy/8765`. Неверный префикс может привести к белому экрану из-за неправильных адресов JavaScript. Проверяйте UI по публичному адресу прокси. Прямой порт рассчитан на локальное использование; внешний доступ требует аутентификации прокси, см. [Security](https://github.com/dev-sergeev/local-agent-chat/blob/main/SECURITY.md).
 
-Старые `.env`, `models.yaml` и каталог данных можно использовать через `localchat run --config-dir /path/to/checkout`. Сценарий `./scripts/run.sh` сохранён для существующих checkout и по-прежнему обрабатывает `.env` как shell-файл, включая прежние подстановки переменных. В новых установках используйте команды `localchat`. Запуск из исходников и проверки описаны в [Contributing](CONTRIBUTING.md), выпуск — в [инструкции публикации](docs/publishing.md).
+Старые `.env`, `models.yaml` и каталог данных можно использовать через `localchat run --config-dir /path/to/checkout`. Сценарий `./scripts/run.sh` сохранён для существующих checkout и по-прежнему обрабатывает `.env` как shell-файл, включая прежние подстановки переменных. В новых установках используйте команды `localchat`. Запуск из исходников и проверки описаны в [Contributing](https://github.com/dev-sergeev/local-agent-chat/blob/main/CONTRIBUTING.md), выпуск — в [инструкции публикации](https://github.com/dev-sergeev/local-agent-chat/blob/main/docs/publishing.md).
 
 ## Контекст и лимиты
 
@@ -106,4 +106,4 @@ UI принимает до 20 файлов по 100 MiB; объём активн
 | Настройки и provider retry | `local_agent_chat/settings.py`, `local_agent_chat/llm_retry.py` |
 | Координация истории и UI | `local_agent_chat/runtime.py`, `local_agent_chat/chainlit_data.py`, `local_agent_chat/app.py` |
 
-[Архитектура](docs/architecture.md), [термины](CONTEXT.md), [ограничения доступа](SECURITY.md), [разработка](CONTRIBUTING.md), [результаты проверок](docs/react-validation.md).
+[Архитектура](https://github.com/dev-sergeev/local-agent-chat/blob/main/docs/architecture.md), [термины](https://github.com/dev-sergeev/local-agent-chat/blob/main/CONTEXT.md), [ограничения доступа](https://github.com/dev-sergeev/local-agent-chat/blob/main/SECURITY.md), [разработка](https://github.com/dev-sergeev/local-agent-chat/blob/main/CONTRIBUTING.md), [результаты проверок](https://github.com/dev-sergeev/local-agent-chat/blob/main/docs/react-validation.md).
