@@ -1,0 +1,121 @@
+name: Publish package
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: Publish to TestPyPI only, or test there and then publish to PyPI
+        type: choice
+        options: [testpypi, pypi]
+        default: testpypi
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+      - name: Require a versioned release tag
+        env:
+          RELEASE_REF: ${{ github.ref }}
+        run: |
+          python - <<'PY'
+          import os, tomllib
+          with open("pyproject.toml", "rb") as source:
+              version = tomllib.load(source)["project"]["version"]
+          assert os.environ["RELEASE_REF"] == f"refs/tags/v{version}", "Run on a v<version> tag matching pyproject.toml"
+          PY
+
+  build-and-test:
+    needs: release-version
+    uses: ./.github/workflows/ci.yml
+
+  publish-testpypi:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/local-agent-chat
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: localchat-dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  test-testpypi:
+    needs: publish-testpypi
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: localchat-dist
+          path: expected-dist
+      - run: python -m pip install requests 'python-socketio[client]'
+      - name: Download the published wheel and verify its digest
+        run: |
+          python - <<'PY'
+          import hashlib, pathlib, subprocess, sys, time, tomllib
+          with open("pyproject.toml", "rb") as source:
+              version = tomllib.load(source)["project"]["version"]
+          for attempt in range(12):
+              result = subprocess.run([sys.executable, "-m", "pip", "download", "--no-deps", "--only-binary=:all:", "--index-url", "https://test.pypi.org/simple/", "--dest", "published-dist", f"local-agent-chat=={version}"])
+              if result.returncode == 0:
+                  break
+              time.sleep(10)
+          else:
+              raise SystemExit("TestPyPI wheel did not become available")
+          published, = pathlib.Path("published-dist").glob("*.whl")
+          expected = pathlib.Path("expected-dist") / published.name
+          assert hashlib.sha256(published.read_bytes()).digest() == hashlib.sha256(expected.read_bytes()).digest(), "Published wheel differs from the tested artifact"
+          PY
+      - name: Test the TestPyPI wheel with runtime dependencies from PyPI
+        run: python scripts/check_distribution.py published-dist/*.whl --work-dir "$RUNNER_TEMP/localchat-testpypi"
+      - name: Save TestPyPI installation results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: testpypi-installation-check
+          path: |
+            ${{ runner.temp }}/localchat-testpypi/*.log
+            ${{ runner.temp }}/localchat-testpypi/result.json
+
+  publish-pypi:
+    needs: test-testpypi
+    if: inputs.repository == 'pypi' || (github.event_name == 'release' && !github.event.release.prerelease)
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/local-agent-chat
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: localchat-dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
