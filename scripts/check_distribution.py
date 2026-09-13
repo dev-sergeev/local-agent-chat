@@ -37,11 +37,11 @@ class Provider(BaseHTTPRequestHandler):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         messages = request["messages"]
         latest = next(m["content"] for m in reversed(messages) if m["role"] == "user")
-        message = {"role": "assistant", "content": "answer:" + str(latest)}
+        message = {"role": "assistant", "content": "Answer: " + str(latest)}
         finish = "stop"
         if request.get("tools") and latest == "read note.txt":
             if messages[-1]["role"] == "tool":
-                message["content"] = "file:" + messages[-1]["content"]
+                message["content"] = "File contents: " + messages[-1]["content"]
             else:
                 finish = "tool_calls"
                 message = {
