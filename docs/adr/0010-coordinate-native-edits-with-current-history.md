@@ -1,0 +1,7 @@
+# Coordinate the native editor with the current Chat History
+
+Chainlit's default editor schedules message updates and deletions independently, while its Message and Step APIs return before SQLite persistence finishes. LocalChat keeps the native UI but handles `edit_message` inside the Chat lock, stages recovery before truncation, waits for background writes before committing, and republishes the authoritative SQLite timeline on both success and rollback. Confirming identical text is a no-op, and the edit task participates in Stop cancellation.
+
+Only current Turn history is retained; this supersedes ADR 0001's permanent technical audit requirement. Temporary recovery rows protect an in-flight Revision and are discarded after its outcome is known; existing `superseded_turns` data is removed on startup without changing active Turns.
+
+Deep Agents' message state uses delta checkpoints, so copying a single raw checkpoint loses earlier messages. Restore materializes delta channels through the graph's state API before publishing a new memory thread. This retains the existing checkpoint-token format and restores old Chats without copying obsolete transcript branches. Regression coverage uses the real Deep Agents graph and SQLite, since a graph with ordinary full-state channels does not reproduce the failure. See the [LangGraph delta-channel contract](https://reference.langchain.com/python/langgraph/channels/delta).
