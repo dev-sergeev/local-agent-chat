@@ -8,7 +8,7 @@
 
 ## Установка и первый запуск
 
-Требуются Python **3.12–3.13**, Linux (или WSL2) и OpenAI-compatible модель с tool calling. Пакет содержит UI, переводы и все ресурсы приложения; клонировать репозиторий для запуска не нужно. Windows без WSL не поддерживается из-за требований файловой песочницы. macOS пока не входит в проверяемые платформы.
+Требуются Python **3.12–3.13**, Linux (или WSL2) и модель с tool calling: OpenAI-compatible API или GigaChat. Пакет содержит UI, переводы и все ресурсы приложения; клонировать репозиторий для запуска не нужно. Windows без WSL не поддерживается из-за требований файловой песочницы. macOS пока не входит в проверяемые платформы.
 
 После публикации в PyPI установите приложение через [pipx](https://pipx.pypa.io/stable/installation/):
 
@@ -18,7 +18,7 @@ localchat init
 localchat run
 ```
 
-`init` запросит модель, адрес API и ключ. Для OpenAI-compatible endpoint имя модели имеет вид `openai:<model-id>`, например `openai:deepseek/deepseek-v4-flash-0731` для OpenRouter. Ключ вводится без отображения в терминале; секрет сессии создаётся автоматически. `run` покажет адрес UI, по умолчанию **http://127.0.0.1:8765/**. Остановка — `Ctrl+C`; `--open-browser` открывает браузер автоматически.
+`init` запросит модель, адрес API и ключ или готовый access token. Запускайте команды в папке, где хотите хранить настройки и историю. Для OpenAI-compatible endpoint имя модели имеет вид `openai:<model-id>`, например `openai:deepseek/deepseek-v4-flash-0731` для OpenRouter. Для GigaChat используйте `gigachat:GigaChat-2` и base URL его API. Ключ вводится без отображения в терминале; секрет сессии создаётся автоматически. `run` покажет адрес UI, по умолчанию **http://127.0.0.1:8765/**. Остановка — `Ctrl+C`; `--open-browser` открывает браузер автоматически.
 
 До первого релиза можно установить собранный wheel: `pipx install --python python3.12 ./dist/local_agent_chat-0.1.0-py3-none-any.whl`. Альтернатива pipx — `python3.12 -m venv .venv`, активация окружения и `python -m pip install local-agent-chat`.
 
@@ -31,32 +31,64 @@ localchat init --no-input --model openai:your-model \
 
 Для автоматической настройки с ключом передайте его в `OPENAI_API_KEY` и используйте те же аргументы без `--no-api-key`. `--api-key-env MY_PROVIDER_KEY` выбирает другое имя переменной; `--no-streaming` отключает потоковый ответ. Полная справка: `localchat init --help`, `localchat run --help`.
 
-## Настройки, данные и обновление
-
-На Linux по умолчанию используются:
-
-- `~/.config/localchat/.env` — параметры запуска и ключи, права нового файла `0600`.
-- `~/.config/localchat/models.yaml` — профили моделей; ключи здесь не хранятся.
-- `~/.local/share/localchat/` — SQLite, история и вложения.
-
-Учитываются `XDG_CONFIG_HOME` и `XDG_DATA_HOME`. `--config-dir PATH` или `LOCALCHAT_CONFIG_DIR` выбирает другой каталог конфигурации, `--data-dir PATH` — каталог данных. Относительные пути из `.env` разрешаются относительно каталога конфигурации. Приоритет: аргументы запуска, затем переменные окружения, затем `.env`, затем значения по умолчанию. `.env` читается как данные: shell-команды и подстановки `${...}` не выполняются.
-
-Повторный `init` не перезаписывает настройки. Для смены модели или ключа отредактируйте конфигурацию и перезапустите приложение. Обновление: `pipx upgrade local-agent-chat`; перед обновлением остановите процесс и сделайте резервную копию каталогов конфигурации и данных. Установка и переустановка пакета их не затрагивают. Два процесса не могут одновременно открыть один каталог данных.
-
-Если запуск сообщает об отсутствующей конфигурации, выполните `localchat init`. Для занятого порта используйте `localchat run --port 8766`. Ошибки модели отображаются в UI и терминале; используйте endpoint с поддержкой tool calling и бюджетом контекста, подходящим выбранной модели.
-
-## JupyterHub и существующая установка
-
-Для прокси задайте **полный публичный префикс**:
+Для GigaChat можно выполнить интерактивную настройку:
 
 ```bash
-localchat run --port 8765 \
-  --root-path "${JUPYTERHUB_SERVICE_PREFIX%/}/vscode/proxy/8765"
+localchat init --model gigachat:GigaChat-2 --base-url https://api.giga.chat/v1
+localchat run
 ```
 
-Здесь переменную раскрывает shell перед вызовом команды. В `.env` нужно записать уже готовый путь, например `/user/alice/vscode/proxy/8765`. Неверный префикс может привести к белому экрану из-за неправильных адресов JavaScript. Проверяйте UI по публичному адресу прокси. Прямой порт рассчитан на локальное использование; внешний доступ требует аутентификации прокси, см. [Security](https://github.com/dev-sergeev/local-agent-chat/blob/main/SECURITY.md).
+Введите **готовый access token**, а не OAuth-ключ `credentials`. Для `--no-input` заранее задайте `GIGACHAT_ACCESS_TOKEN`; `--api-key-env COMPANY_TOKEN` выбирает другое имя переменной. OAuth и автоматическое обновление токена не выполняются. Если токен истёк, обновите его в `.env` (или в окружении, если оно переопределяет файл) и перезапустите приложение. `--no-api-key` доступен только для локального OpenAI-compatible API. Проверка TLS остаётся включённой; для собственного центра сертификации SDK поддерживает `GIGACHAT_CA_BUNDLE_FILE` с абсолютным путём к сертификатам.
 
-Старые `.env`, `models.yaml` и каталог данных можно использовать через `localchat run --config-dir /path/to/checkout`. Сценарий `./scripts/run.sh` сохранён для существующих checkout и по-прежнему обрабатывает `.env` как shell-файл, включая прежние подстановки переменных. В новых установках используйте команды `localchat`. Запуск из исходников и проверки описаны в [Contributing](https://github.com/dev-sergeev/local-agent-chat/blob/main/CONTRIBUTING.md), выпуск — в [инструкции публикации](https://github.com/dev-sergeev/local-agent-chat/blob/main/docs/publishing.md).
+## Настройки, данные и обновление
+
+В текущей рабочей папке создаются:
+
+- `.env` — параметры запуска и токены, права нового файла `0600`.
+- `models.yaml` — профили моделей: идентификатор, base URL, streaming и имя переменной токена; секреты здесь не хранятся.
+- `.local-agent-chat/` — SQLite, история, память агента и вложения. Технические логи выводятся в консоль.
+
+`APP_DATA_DIR=.local-agent-chat` и `MODEL_PROFILES_FILE=models.yaml` сохраняются относительными путями. `--config-dir PATH` или `LOCALCHAT_CONFIG_DIR` выбирает другой каталог конфигурации; его каталог данных по умолчанию также находится рядом с `.env`. `--data-dir PATH` или `APP_DATA_DIR` переопределяет каталог данных. Относительные пути разрешаются относительно каталога конфигурации. Приоритет: аргументы запуска, затем переменные окружения, затем `.env`, затем значения по умолчанию. `XDG_CONFIG_HOME` и `XDG_DATA_HOME` больше не выбирают расположение данных LocalChat.
+
+Повторный `init` не перезаписывает настройки. Для смены модели или ключа отредактируйте конфигурацию и перезапустите приложение. Для нескольких моделей добавьте профили в `models.yaml` с уникальными `id`, например:
+
+```yaml
+models:
+  - id: openrouter
+    label: DeepSeek
+    model: openai:deepseek/deepseek-v4-flash-0731
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENAI_API_KEY
+  - id: giga
+    label: GigaChat 2
+    model: gigachat:GigaChat-2
+    base_url: https://api.giga.chat/v1
+    api_key_env: GIGACHAT_ACCESS_TOKEN
+```
+
+Токены обоих профилей задаются в `.env`. Модели используются для ответа, инструментов, суммаризации и названий чатов.
+
+Обновление: `pipx upgrade local-agent-chat` или `python -m pip install --upgrade local-agent-chat`. Перед обновлением или переносом папки остановите процесс. Папку с `.env`, `models.yaml` и `.local-agent-chat/` можно скопировать целиком и запустить в новом месте; относительные пути продолжат работать. Абсолютные пути нужно изменить отдельно. Два процесса не могут одновременно открыть один каталог данных, даже на разных портах.
+
+Если запуск сообщает об отсутствующей конфигурации, выполните `localchat init`. По умолчанию сервер начинает с порта `8765`; если он занят, пробует следующие до `65535`. `localchat run --port 9000` меняет начальный порт. Фактический порт показывается при запуске. Ошибки модели отображаются в UI и терминале; используйте endpoint с поддержкой tool calling и подходящим бюджетом контекста.
+
+## JupyterHub и VS Code proxy
+
+В новом `.env` записывается `APP_ROOT_PATH=auto`. При наличии `JUPYTERHUB_SERVICE_PREFIX` сервер автоматически использует `<prefix>/vscode/proxy/<фактический порт>`. Вне JupyterHub префикс пустой, приложение открывается напрямую.
+
+Также поддерживается точная запись:
+
+```dotenv
+APP_ROOT_PATH="${JUPYTERHUB_SERVICE_PREFIX%/}/vscode/proxy/$APP_PORT"
+```
+
+Этот шаблон раскрывается самим CLI после выбора свободного порта; без JupyterHub он даёт `/vscode/proxy/<порт>`. Остальные значения `.env` читаются буквально, shell-команды не выполняются. Явный `--root-path /custom/path` или статический путь в `.env` используется без замены порта. `--root-path ''` либо `APP_ROOT_PATH=''` отключает префикс даже в JupyterHub.
+
+Открывайте UI по публичному адресу прокси. Прямой порт рассчитан на локальное использование; внешний доступ требует аутентификации прокси, см. [Security](https://github.com/dev-sergeev/local-agent-chat/blob/main/SECURITY.md).
+
+Прежние системные каталоги автоматически не переносятся. Для старой установки используйте `localchat run --config-dir ~/.config/localchat`, сохранив прежний `APP_DATA_DIR` в её `.env`. Для перехода на локальную папку остановите сервис, скопируйте `.env`, `models.yaml` и содержимое прежнего каталога данных в `.local-agent-chat/`, затем задайте относительный `APP_DATA_DIR`. Пустой старый `APP_ROOT_PATH` сохраняет прямой запуск; замените его на `auto` для автоматического прокси.
+
+`./scripts/run.sh` делегирует запуск Python CLI из текущей рабочей папки и больше не выполняет `.env` как shell-скрипт. Для совместимости можно задать `ENV_FILE=/path/to/.env`; для другого расположения используйте `--config-dir`. Запуск из исходников и проверки описаны в [Contributing](https://github.com/dev-sergeev/local-agent-chat/blob/main/CONTRIBUTING.md), выпуск — в [инструкции публикации](https://github.com/dev-sergeev/local-agent-chat/blob/main/docs/publishing.md).
 
 ## Контекст и лимиты
 
@@ -81,7 +113,7 @@ localchat run --port 8765 \
 
 ## Надёжность и хранение
 
-Provider SDK повторяет отдельные transient HTTP-запросы; полный ход агента и инструменты не переигрываются. Настройки: `LLM_MAX_RETRIES=3`, `LLM_REQUEST_TIMEOUT_SECONDS=60`, `LLM_STREAM_CHUNK_TIMEOUT_SECONDS=120`, `LLM_STREAM_RETRIES=1`, `LLM_AUXILIARY_TIMEOUT_SECONDS=30`. Дополнительная попытка streaming допустима только до первого полученного chunk. Для суммаризации действует та же политика без вложенного `with_retry`.
+OpenAI SDK и адаптер GigaChat повторяют отдельные transient HTTP-запросы; полный ход агента и инструменты не переигрываются. Настройки: `LLM_MAX_RETRIES=3`, `LLM_REQUEST_TIMEOUT_SECONDS=60`, `LLM_STREAM_CHUNK_TIMEOUT_SECONDS=120`, `LLM_STREAM_RETRIES=1`, `LLM_AUXILIARY_TIMEOUT_SECONDS=30`. Дополнительная попытка streaming допустима только до первого полученного chunk. Для суммаризации действует та же политика без вложенного `with_retry`.
 
 В `APP_DATA_DIR` находятся:
 
@@ -103,7 +135,7 @@ UI принимает до 20 файлов по 100 MiB; объём активн
 | Хранение контекста и откат | `local_agent_chat/agent_memory.py` |
 | Четыре инструмента чтения | `local_agent_chat/sandbox_tools.py` |
 | System prompt и заголовки | `local_agent_chat/prompts.py` |
-| Настройки и provider retry | `local_agent_chat/settings.py`, `local_agent_chat/llm_retry.py` |
+| Настройки и provider retry | `local_agent_chat/settings.py`, `local_agent_chat/llm_retry.py`, `local_agent_chat/providers.py` |
 | Координация истории и UI | `local_agent_chat/runtime.py`, `local_agent_chat/chainlit_data.py`, `local_agent_chat/app.py` |
 
 [Архитектура](https://github.com/dev-sergeev/local-agent-chat/blob/main/docs/architecture.md), [термины](https://github.com/dev-sergeev/local-agent-chat/blob/main/CONTEXT.md), [ограничения доступа](https://github.com/dev-sergeev/local-agent-chat/blob/main/SECURITY.md), [разработка](https://github.com/dev-sergeev/local-agent-chat/blob/main/CONTRIBUTING.md), [результаты проверок](https://github.com/dev-sergeev/local-agent-chat/blob/main/docs/react-validation.md).

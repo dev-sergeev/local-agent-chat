@@ -4,8 +4,8 @@
 
 ```bash
 python -m pip install -e '.[test]' build twine
-localchat init --config-dir . --data-dir .local-agent-chat
-localchat run --config-dir .
+localchat init
+localchat run
 ```
 
 Не используйте реальные секреты в тестах. Проверяйте запрет выхода из песочницы на файлах, созданных через `tmp_path`; тест не должен читать настоящие системные или пользовательские файлы.
@@ -19,7 +19,7 @@ ruff format --check .
 python -m compileall -q local_agent_chat
 bash -n scripts/run.sh
 python -m build
-python -m twine check dist/*
+python -m twine check dist/*.whl dist/*.tar.gz
 python scripts/check_distribution.py dist/*.whl
 ```
 
