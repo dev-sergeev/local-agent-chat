@@ -8,7 +8,7 @@ from .chat_bindings import ChatBindings
 from .chat_titles import normalize_chat_title
 from .llm_retry import RetryBlock
 from .prompts import CHAT_TITLE_SYSTEM_PROMPT
-from .settings import ModelProfile
+from .settings import ModelProfile, parse_model
 
 
 class AuxiliaryLabels:
@@ -28,10 +28,16 @@ class AuxiliaryLabels:
     def _model(self, profile_id: str) -> Any:
         model = self._label_models.get(profile_id)
         if model is None:
+            profile = self._models[profile_id]
+            options = (
+                {"reasoning_effort": "none"}
+                if parse_model(profile.model)[0] == "openai"
+                else {}
+            )
             model = self._retry.create_model(
-                self._models[profile_id],
+                profile,
                 max_tokens=32,
-                reasoning_effort="none",
+                **options,
             )
             self._label_models[profile_id] = model
         return model

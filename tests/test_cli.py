@@ -15,7 +15,16 @@ from local_agent_chat.installation import config_directory, runtime_workspace
 def isolated_env(monkeypatch, tmp_path):
     for name in list(os.environ):
         if name.startswith(
-            ("APP_", "CHAINLIT_", "LOCALCHAT_", "MODEL_", "OPENAI_", "AGENT_", "LLM_")
+            (
+                "APP_",
+                "CHAINLIT_",
+                "LOCALCHAT_",
+                "MODEL_",
+                "OPENAI_",
+                "GIGACHAT_",
+                "AGENT_",
+                "LLM_",
+            )
         ):
             monkeypatch.delenv(name)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
@@ -183,6 +192,84 @@ def test_help_and_version_do_not_initialize_chainlit(tmp_path):
         assert result.returncode == 0, result.stderr
         assert "localchat" in result.stdout
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "model,key_name",
+    [
+        ("openai:deepseek/deepseek-v4-flash-0731", "OPENAI_API_KEY"),
+        ("gigachat:GigaChat-2", "GIGACHAT_ACCESS_TOKEN"),
+    ],
+)
+def test_init_provider_and_local_directory(isolated_env, monkeypatch, model, key_name):
+    monkeypatch.setenv(key_name, "test-token")
+    assert (
+        main(
+            [
+                "init",
+                "--no-input",
+                "--model",
+                model,
+                "--base-url",
+                "https://models.example/v1",
+            ]
+        )
+        == 0
+    )
+    profile = yaml.safe_load((isolated_env / "models.yaml").read_text())["models"][0]
+    env = dotenv_values(isolated_env / ".env", interpolate=False)
+    assert profile["model"] == model
+    assert profile["api_key_env"] == key_name
+    assert profile["base_url"] == "https://models.example/v1"
+    assert env[key_name] == "test-token"
+    assert "test-token" not in (isolated_env / "models.yaml").read_text()
+
+
+def test_init_gigachat_custom_token_variable(isolated_env, monkeypatch):
+    monkeypatch.setenv("COMPANY_TOKEN", "custom-token")
+    assert (
+        main(
+            [
+                "init",
+                "--no-input",
+                "--model",
+                "gigachat:GigaChat-2",
+                "--base-url",
+                "https://models.example/v1",
+                "--api-key-env",
+                "COMPANY_TOKEN",
+            ]
+        )
+        == 0
+    )
+    assert dotenv_values(isolated_env / ".env")["COMPANY_TOKEN"] == "custom-token"
+
+
+@pytest.mark.parametrize(
+    "model,no_key",
+    [
+        ("other:model", True),
+        ("openai:", True),
+        ("gigachat:", True),
+        ("gigachat:GigaChat-2", True),
+        ("gigachat:GigaChat-2", False),
+    ],
+)
+def test_init_invalid_provider_or_missing_gigachat_token_leaves_no_files(
+    isolated_env, model, no_key
+):
+    arguments = [
+        "init",
+        "--no-input",
+        "--model",
+        model,
+        "--base-url",
+        "https://models.example/v1",
+    ]
+    if no_key:
+        arguments.append("--no-api-key")
+    assert main(arguments) == 2
+    assert list(isolated_env.iterdir()) == []
 
 
 def test_init_custom_directory_and_data_are_relative_to_config(isolated_env):

@@ -6,7 +6,6 @@ from pathlib import Path
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import ModelCallLimitMiddleware
-from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage
 
 from .agent_context import ContextSummary, ModelGuardrails
@@ -54,7 +53,7 @@ class AgentExecution:
         self._sandbox = sandbox
         self._history = history
         self._config = config
-        self._retry = retry_block or RetryBlock(LLMRetryConfig(), init_chat_model)
+        self._retry = retry_block or RetryBlock(LLMRetryConfig())
         self._graphs = {}
         self._locks: dict[str, asyncio.Lock] = {}
 

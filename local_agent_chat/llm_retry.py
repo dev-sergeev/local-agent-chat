@@ -7,6 +7,7 @@ from typing import Any, TypeVar
 
 from langchain_openai import StreamChunkTimeoutError
 
+from .providers import ModelStreamTimeout, create_chat_model
 from .settings import LLMRetryConfig, ModelProfile
 
 T = TypeVar("T")
@@ -16,6 +17,11 @@ _RESERVED_MODEL_ARGUMENTS = frozenset(
     {
         "model",
         "api_key",
+        "access_token",
+        "credentials",
+        "user",
+        "password",
+        "auth_url",
         "base_url",
         "max_retries",
         "timeout",
@@ -35,7 +41,7 @@ class RetryBlock:
     """
 
     config: LLMRetryConfig
-    model_factory: ModelFactory
+    model_factory: ModelFactory = create_chat_model
 
     def create_model(self, profile: ModelProfile, **kwargs: Any) -> Any:
         """Create a model whose provider retry behavior cannot be bypassed."""
@@ -75,7 +81,7 @@ class RetryBlock:
         while True:
             try:
                 return await awaitable_factory()
-            except StreamChunkTimeoutError as error:
+            except (StreamChunkTimeoutError, ModelStreamTimeout) as error:
                 if error.chunks_received != 0 or retries >= self.config.stream_retries:
                     raise
                 retries += 1

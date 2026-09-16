@@ -10,6 +10,13 @@ import yaml
 from .installation import config_directory, data_directory
 
 
+def parse_model(value: str) -> tuple[str, str]:
+    provider, separator, model = value.partition(":")
+    if provider not in {"openai", "gigachat"} or not separator or not model.strip():
+        raise ValueError("Use openai:<model-id> or gigachat:<model-id>.")
+    return provider, model
+
+
 @dataclass(frozen=True)
 class ModelProfile:
     id: str
@@ -22,6 +29,7 @@ class ModelProfile:
     summary_options: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        parse_model(self.model)
         if not isinstance(self.summary_options, dict):
             raise ValueError("summary_options must be a mapping of model arguments")
         if {

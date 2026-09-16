@@ -13,7 +13,6 @@ from chainlit.input_widget import Switch
 from chainlit.server import app, router
 from fastapi import HTTPException
 from fastapi.responses import FileResponse
-from langchain.chat_models import init_chat_model
 
 from local_agent_chat.agent_events import safe_text
 from local_agent_chat.agent_execution import AgentExecution
@@ -85,7 +84,7 @@ chat_bindings = ChatBindings(
     checkpoint_database,
     (model.id for model in settings.models),
 )
-retry_block = RetryBlock(settings.llm_retry, init_chat_model)
+retry_block = RetryBlock(settings.llm_retry)
 auxiliary_labels = AuxiliaryLabels(settings.models, chat_bindings, retry_block)
 agent_execution = AgentExecution(
     checkpoint_database,

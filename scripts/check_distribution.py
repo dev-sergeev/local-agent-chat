@@ -2,7 +2,7 @@
 
 Run with the test dependencies installed in the invoking interpreter. The fresh
 application environment receives only the wheel's normal runtime dependencies.
-All provider requests go to a deterministic local OpenAI-compatible test server.
+All provider requests go to a deterministic local OpenAI/GigaChat test server.
 """
 
 from __future__ import annotations
@@ -39,8 +39,10 @@ class Provider(BaseHTTPRequestHandler):
         latest = next(m["content"] for m in reversed(messages) if m["role"] == "user")
         message = {"role": "assistant", "content": "Answer: " + str(latest)}
         finish = "stop"
-        if request.get("tools") and latest == "read note.txt":
-            if messages[-1]["role"] == "tool":
+        if (
+            request.get("tools") or request.get("functions")
+        ) and latest == "read note.txt":
+            if messages[-1]["role"] in {"tool", "function"}:
                 message["content"] = "File contents: " + messages[-1]["content"]
             else:
                 finish = "tool_calls"
@@ -58,6 +60,16 @@ class Provider(BaseHTTPRequestHandler):
                         }
                     ],
                 }
+                if request.get("functions"):
+                    finish = "function_call"
+                    message = {
+                        "role": "assistant",
+                        "content": "",
+                        "function_call": {
+                            "name": "read_file",
+                            "arguments": {"file_path": "/note.txt"},
+                        },
+                    }
         body = json.dumps(
             {
                 "id": "chatcmpl-local-test",
@@ -259,6 +271,7 @@ def check(wheel: Path, work: Path):
                 "LOCALCHAT_",
                 "MODEL_",
                 "OPENAI_",
+                "GIGACHAT_",
                 "AGENT_",
                 "LLM_",
                 "PYTHONPATH",
@@ -434,6 +447,43 @@ def check(wheel: Path, work: Path):
         assert not (work / "config").exists()
         assert not (work / "data").exists()
         assert not list(data.glob(".runtime-*"))
+        giga_project = work / "gigachat-project"
+        giga_project.mkdir()
+        giga_env = application_env | {"GIGACHAT_ACCESS_TOKEN": "test-access-token"}
+        subprocess.run(
+            [
+                str(executable),
+                "init",
+                "--no-input",
+                "--model",
+                "gigachat:GigaChat-2",
+                "--base-url",
+                f"http://127.0.0.1:{provider.server_port}/v1",
+                "--no-streaming",
+            ],
+            cwd=giga_project,
+            env=giga_env,
+            check=True,
+        )
+        # Verify that run reads the saved token instead of relying on the parent.
+        with service(
+            executable,
+            giga_project,
+            free_port(),
+            "",
+            giga_project,
+            application_env,
+            work / "server-gigachat.log",
+        ) as (root, _html):
+            chat = Chat(root, "")
+            try:
+                expected = [chat.send("read note.txt", file=True)]
+                turns = verify_history(
+                    giga_project / ".local-agent-chat", chat.thread, expected
+                )
+                assert "PACKAGE-CANARY" in turns[0][2]
+            finally:
+                chat.close()
         for log in work.glob("server-*.log"):
             text = log.read_text()
             assert not any(
@@ -458,6 +508,7 @@ def check(wheel: Path, work: Path):
                         "edit third request",
                         "reinstallation",
                         "moved project directory",
+                        "native GigaChat tools",
                         "resume",
                         "edit first request",
                         "SQLite integrity",

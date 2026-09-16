@@ -15,7 +15,7 @@ class SettingsTest(unittest.TestCase):
                 "models:\n"
                 "  - id: local\n"
                 "    label: Local model\n"
-                "    model: openai-compatible:local\n"
+                "    model: openai:local\n"
                 "    api_key_env: LOCAL_MODEL_KEY\n"
                 "    streaming: false\n",
                 encoding="utf-8",

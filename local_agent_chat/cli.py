@@ -19,6 +19,7 @@ import yaml
 from dotenv.parser import parse_stream
 
 from .installation import ASSETS, config_directory, data_directory, runtime_workspace
+from .settings import parse_model
 
 
 def _path(value: str | Path, relative_to: Path) -> Path:
@@ -68,25 +69,34 @@ def initialize(args: argparse.Namespace) -> None:
             or input(f"Model [{defaults['model']}]: ").strip()
             or defaults["model"]
         )
+        provider, _ = parse_model(model)
+        default_url = (
+            "https://api.giga.chat/v1"
+            if provider == "gigachat"
+            else "https://openrouter.ai/api/v1"
+        )
         base_url = (
-            base_url
-            or input("API base URL [https://openrouter.ai/api/v1]: ").strip()
-            or "https://openrouter.ai/api/v1"
+            base_url or input(f"API base URL [{default_url}]: ").strip() or default_url
         )
     if not model or not base_url:
         raise ValueError("For --no-input, supply --model and --base-url.")
-    if not model.startswith("openai:") or not model.removeprefix("openai:").strip():
-        raise ValueError("Use openai:<model-id> for an OpenAI-compatible provider.")
+    provider, model_id = parse_model(model)
     base_url = _endpoint(base_url)
-    key_name = args.api_key_env
+    key_name = args.api_key_env or (
+        "GIGACHAT_ACCESS_TOKEN" if provider == "gigachat" else "OPENAI_API_KEY"
+    )
     if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key_name) or not key_name.endswith(
         ("KEY", "TOKEN")
     ):
         raise ValueError("Choose an API-key environment name such as OPENAI_API_KEY.")
+    if args.no_api_key and provider != "openai":
+        raise ValueError(
+            "--no-api-key is only supported for OpenAI-compatible local APIs."
+        )
     key = "not-required" if args.no_api_key else os.environ.get(key_name, "")
     if not key and not args.no_input:
         key = getpass.getpass(
-            f"API key (saved privately in {directory / '.env'}): "
+            f"API key / access token (saved privately in {directory / '.env'}): "
         ).strip()
     if not key:
         raise ValueError(
@@ -94,13 +104,13 @@ def initialize(args: argparse.Namespace) -> None:
         )
     profile = {
         "id": "default",
-        "label": model.removeprefix("openai:"),
+        "label": model_id,
         "model": model,
         "base_url": base_url,
         "api_key_env": key_name,
         "streaming": not args.no_streaming,
     }
-    if urlsplit(base_url).hostname == "openrouter.ai":
+    if provider == "openai" and urlsplit(base_url).hostname == "openrouter.ai":
         profile["summary_options"] = {"extra_body": {"reasoning": {"enabled": False}}}
     values = {
         "APP_HOST": "127.0.0.1",
@@ -288,15 +298,14 @@ def main(argv: list[str] | None = None) -> int:
         "--data-dir", help="Data directory (default: .local-agent-chat beside .env)."
     )
     init.add_argument(
-        "--model", help="OpenAI-compatible identifier, e.g. openai:your-model."
+        "--model", help="Model identifier: openai:<model-id> or gigachat:<model-id>."
     )
     init.add_argument(
         "--base-url", help="Provider's API base URL, including /v1 if required."
     )
     init.add_argument(
         "--api-key-env",
-        default="OPENAI_API_KEY",
-        help="Environment variable to read the API key from.",
+        help="Token variable (default: OPENAI_API_KEY or GIGACHAT_ACCESS_TOKEN).",
     )
     init.add_argument(
         "--no-api-key",
