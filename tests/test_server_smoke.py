@@ -8,17 +8,34 @@ import uuid
 from hashlib import sha256
 from pathlib import Path
 
+import pytest
 import requests
 import socketio
 
+from local_agent_chat.cli import PROXY_TEMPLATE, reserve_port
 
-def test_chainlit_server_works_behind_root_path(tmp_path: Path) -> None:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
+
+@pytest.fixture(params=["static", "auto", PROXY_TEMPLATE])
+def server_address(request):
+    with socket.socket() as busy:
+        busy.bind(("127.0.0.1", 0))
+        start = busy.getsockname()[1]
+        if request.param == "static":
+            busy.close()
+            yield start, start, "static"
+        else:
+            busy.listen()
+            with reserve_port("127.0.0.1", start) as candidate:
+                port = candidate.getsockname()[1]
+            yield start, port, request.param
+
+
+def test_chainlit_server_works_behind_root_path(tmp_path: Path, server_address) -> None:
+    start, port, mode = server_address
     prefix = f"/user/test/vscode/proxy/{port}"
     env = os.environ | {
-        "APP_ROOT_PATH": prefix,
+        "APP_ROOT_PATH": prefix if mode == "static" else mode,
+        "JUPYTERHUB_SERVICE_PREFIX": "/user/test/",
         "APP_DATA_DIR": str(tmp_path / "data"),
         "MODEL_PROFILES_FILE": str(Path("models.example.yaml").resolve()),
         "LOCAL_MODEL_API_KEY": "dummy",
@@ -36,9 +53,7 @@ def test_chainlit_server_works_behind_root_path(tmp_path: Path) -> None:
             "--host",
             "127.0.0.1",
             "--port",
-            str(port),
-            "--root-path",
-            prefix,
+            str(start),
         ],
         env=env,
         stdout=subprocess.PIPE,

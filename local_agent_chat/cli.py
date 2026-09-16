@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import getpass
 import os
 import re
@@ -20,6 +21,45 @@ from dotenv.parser import parse_stream
 
 from .installation import ASSETS, config_directory, data_directory, runtime_workspace
 from .settings import parse_model
+
+PROXY_TEMPLATE = "${JUPYTERHUB_SERVICE_PREFIX%/}/vscode/proxy/$APP_PORT"
+
+
+def resolve_root_path(value: str, port: int) -> str:
+    if value in {"auto", PROXY_TEMPLATE}:
+        service_prefix = os.environ.get("JUPYTERHUB_SERVICE_PREFIX", "")
+        value = (
+            f"{service_prefix.rstrip('/')}/vscode/proxy/{port}"
+            if service_prefix or value == PROXY_TEMPLATE
+            else ""
+        )
+    prefix = "/" + value.strip("/") if value.strip("/") else ""
+    if (
+        any(char in prefix for char in ("?", "#", "\\", "$"))
+        or any(char.isspace() or ord(char) < 32 for char in prefix)
+        or any(part in {".", ".."} for part in prefix.split("/"))
+    ):
+        raise ValueError(
+            "Root path must be auto or a URL path, such as /user/name/vscode/proxy/8765."
+        )
+    return prefix
+
+
+def reserve_port(host: str, first_port: int) -> socket.socket:
+    """Keep the selected port bound until the child inherits the socket."""
+    for port in range(first_port, 65536):
+        listener = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET)
+        try:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((host, port))
+            listener.listen(128)
+            listener.setblocking(False)
+            return listener
+        except OSError as error:
+            listener.close()
+            if error.errno != errno.EADDRINUSE:
+                raise
+    raise ValueError(f"No free port from {first_port} to 65535.")
 
 
 def _path(value: str | Path, relative_to: Path) -> Path:
@@ -115,7 +155,7 @@ def initialize(args: argparse.Namespace) -> None:
     values = {
         "APP_HOST": "127.0.0.1",
         "APP_PORT": "8765",
-        "APP_ROOT_PATH": "",
+        "APP_ROOT_PATH": "auto",
         "APP_DATA_DIR": args.data_dir
         or os.environ.get("APP_DATA_DIR")
         or ".local-agent-chat",
@@ -197,16 +237,10 @@ def run(args: argparse.Namespace) -> int:
     prefix = (
         args.root_path
         if args.root_path is not None
-        else os.environ.get("APP_ROOT_PATH", "")
+        else os.environ.get("APP_ROOT_PATH", "auto")
     )
-    prefix = "/" + prefix.strip("/") if prefix.strip("/") else ""
-    if any(char in prefix for char in ("?", "#", "\\", "$", " ")) or any(
-        part in {".", ".."} for part in prefix.split("/")
-    ):
-        raise ValueError(
-            "Root path must be a URL path, such as /user/name/vscode/proxy/8765."
-        )
-    os.environ["APP_ROOT_PATH"] = prefix
+    # Validate before creating runtime files; recalculate after reserving a port.
+    os.environ["APP_ROOT_PATH"] = resolve_root_path(prefix, port)
     secret = os.environ.get("CHAINLIT_AUTH_SECRET", "")
     if len(secret) < 32 or secret.startswith("replace-"):
         raise ValueError(
@@ -220,11 +254,15 @@ def run(args: argparse.Namespace) -> int:
             raise ValueError(
                 f"Set {profile.api_key_env} for model profile {profile.id}."
             )
-    # Detect a common startup failure before printing the UI address.
-    with socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET) as probe:
-        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        probe.bind((host, port))
-    with runtime_workspace(settings.data_dir) as root:
+    with (
+        runtime_workspace(settings.data_dir) as root,
+        reserve_port(host, port) as listener,
+    ):
+        port = listener.getsockname()[1]
+        prefix = resolve_root_path(prefix, port)
+        os.environ["APP_HOST"] = host
+        os.environ["APP_PORT"] = str(port)
+        os.environ["APP_ROOT_PATH"] = prefix
         os.environ["CHAINLIT_APP_ROOT"] = str(root)
         os.environ["CHAINLIT_ENV_FILE"] = os.devnull
         os.environ["CHAINLIT_HOST"] = host
@@ -240,22 +278,18 @@ def run(args: argparse.Namespace) -> int:
         arguments = [
             sys.executable,
             "-m",
-            "chainlit",
-            "run",
-            str(Path(__file__).with_name("app.py")),
-            "--host",
-            host,
-            "--port",
-            str(port),
-            "--root-path",
-            prefix,
+            "local_agent_chat.server",
+            str(listener.fileno()),
         ]
-        if not args.open_browser:
-            arguments.append("--headless")
+        if args.open_browser:
+            arguments.append("--open-browser")
         # Chainlit's lifespan calls os._exit(), bypassing Python finalizers.
         # Own its writable workspace in a parent process so cleanup still runs.
         # A separate process group prevents Ctrl+C being delivered twice.
-        process = subprocess.Popen(arguments, start_new_session=True)
+        process = subprocess.Popen(
+            arguments, start_new_session=True, pass_fds=(listener.fileno(),)
+        )
+        listener.close()
 
         def forward_signal(signum, _frame):
             if process.poll() is None:
@@ -326,9 +360,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     start.add_argument("--data-dir", help="Override the persistent data directory.")
     start.add_argument("--host", help="Listening address (default: 127.0.0.1).")
-    start.add_argument("--port", type=int, help="Listening port (default: 8765).")
+    start.add_argument("--port", type=int, help="First port to try (default: 8765).")
     start.add_argument(
-        "--root-path", help="Full public URL prefix when hosted behind a proxy."
+        "--root-path",
+        help="Public URL prefix; auto detects JupyterHub, empty disables it.",
     )
     start.add_argument(
         "--open-browser", action="store_true", help="Open a browser on startup."

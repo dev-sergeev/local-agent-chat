@@ -24,6 +24,7 @@ def isolated_env(monkeypatch, tmp_path):
                 "GIGACHAT_",
                 "AGENT_",
                 "LLM_",
+                "JUPYTERHUB_",
             )
         ):
             monkeypatch.delenv(name)
@@ -59,6 +60,7 @@ def test_init_preserves_literal_secrets_and_existing_configuration(
     assert len(settings["CHAINLIT_AUTH_SECRET"]) >= 32
     assert directory == isolated_env
     assert settings["APP_DATA_DIR"] == ".local-agent-chat"
+    assert settings["APP_ROOT_PATH"] == "auto"
     assert (directory / ".local-agent-chat").is_dir()
     assert not (isolated_env / "config").exists()
     assert not (isolated_env / "data").exists()
@@ -308,3 +310,71 @@ def test_two_projects_and_moved_configuration_are_independent(
     assert settings.data_dir == moved / ".local-agent-chat"
     assert (settings.data_dir / "existing.sqlite3").read_bytes() == b"persisted"
     assert not (second / ".local-agent-chat" / "existing.sqlite3").exists()
+
+
+@pytest.mark.parametrize(
+    "prefix,setting,expected",
+    [
+        ("/user/alice/", "auto", "/user/alice/vscode/proxy/8766"),
+        ("/user/alice", "auto", "/user/alice/vscode/proxy/8766"),
+        ("", "auto", ""),
+        ("/user/alice/", "", ""),
+        ("/user/alice/", "/custom/", "/custom"),
+        (
+            "/user/alice/",
+            "${JUPYTERHUB_SERVICE_PREFIX%/}/vscode/proxy/$APP_PORT",
+            "/user/alice/vscode/proxy/8766",
+        ),
+        (
+            "",
+            "${JUPYTERHUB_SERVICE_PREFIX%/}/vscode/proxy/$APP_PORT",
+            "/vscode/proxy/8766",
+        ),
+    ],
+)
+def test_proxy_prefix_uses_final_port(monkeypatch, prefix, setting, expected):
+    from local_agent_chat.cli import resolve_root_path
+
+    monkeypatch.setenv("JUPYTERHUB_SERVICE_PREFIX", prefix)
+    assert resolve_root_path(setting, 8766) == expected
+
+
+def test_port_reservation_skips_busy_ports_and_keeps_selected_port_bound():
+    import socket
+
+    from local_agent_chat.cli import reserve_port
+
+    with socket.socket() as busy:
+        busy.bind(("127.0.0.1", 0))
+        busy.listen()
+        start = busy.getsockname()[1]
+        with reserve_port("127.0.0.1", start) as first:
+            assert first.getsockname()[1] > start
+            with reserve_port("127.0.0.1", start) as second:
+                assert second.getsockname()[1] > first.getsockname()[1]
+
+
+@pytest.mark.parametrize("error_number", [13, 98])
+def test_port_errors_and_upper_bound(monkeypatch, error_number):
+    import errno
+
+    from local_agent_chat import cli
+
+    error_number = errno.EACCES if error_number == 13 else errno.EADDRINUSE
+    attempted = []
+
+    class Socket:
+        def setsockopt(self, *args):
+            pass
+
+        def bind(self, address):
+            attempted.append(address)
+            raise OSError(error_number, "test bind error")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(cli.socket, "socket", lambda *args: Socket())
+    with pytest.raises(PermissionError if error_number == errno.EACCES else ValueError):
+        cli.reserve_port("127.0.0.1", 65535)
+    assert attempted == [("127.0.0.1", 65535)]

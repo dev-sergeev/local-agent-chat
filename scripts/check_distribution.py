@@ -272,6 +272,7 @@ def check(wheel: Path, work: Path):
                 "MODEL_",
                 "OPENAI_",
                 "GIGACHAT_",
+                "JUPYTERHUB_",
                 "AGENT_",
                 "LLM_",
                 "PYTHONPATH",

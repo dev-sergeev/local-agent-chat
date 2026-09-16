@@ -14,7 +14,17 @@ def test_cli_signal_runs_final_cleanup(tmp_path, stop_signal):
     environment = {
         name: value
         for name, value in os.environ.items()
-        if not name.startswith(("APP_", "MODEL_", "LOCALCHAT_", "CHAINLIT_", "OPENAI_"))
+        if not name.startswith(
+            (
+                "APP_",
+                "MODEL_",
+                "LOCALCHAT_",
+                "CHAINLIT_",
+                "OPENAI_",
+                "GIGACHAT_",
+                "JUPYTERHUB_",
+            )
+        )
     }
     environment.update(
         XDG_CONFIG_HOME=str(tmp_path / "config"), XDG_DATA_HOME=str(tmp_path / "data")
