@@ -11,11 +11,12 @@ import chainlit.data as chainlit_data_runtime
 import pytest
 from chainlit.context import ChainlitContext, context_var
 from chainlit.emitter import BaseChainlitEmitter
+from chainlit.server import sio
 from chainlit.session import HTTPSession
 from chainlit.user import User
-from langchain import chat_models as langchain_chat_models
 from langchain_core.messages import AIMessage
 
+from local_agent_chat import providers
 from local_agent_chat.agent_events import EventSink
 from local_agent_chat.chat_titles import (
     CHAT_TITLE_GENERATED,
@@ -87,10 +88,12 @@ async def test_transient_chat_title_failure_retries_on_next_turn(
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     title_model = TransientTitleModel()
     monkeypatch.setattr(
-        langchain_chat_models,
-        "init_chat_model",
+        providers,
+        "OpenAIModel",
         lambda *_args, **_kwargs: title_model,
     )
+    for event in ("client_message", "edit_message"):
+        monkeypatch.setitem(sio.handlers["/"], event, sio.handlers["/"][event])
     module_name = "_chat_title_lifecycle_app"
     app_path = Path(__file__).parents[1] / "local_agent_chat" / "app.py"
     spec = importlib.util.spec_from_file_location(module_name, app_path)

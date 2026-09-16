@@ -20,7 +20,7 @@ import yaml
 from dotenv.parser import parse_stream
 
 from .installation import ASSETS, config_directory, data_directory, runtime_workspace
-from .settings import parse_model
+from .settings import AgentConfig, ModelProfile, parse_model
 
 PROXY_TEMPLATE = "${JUPYTERHUB_SERVICE_PREFIX%/}/vscode/proxy/$APP_PORT"
 
@@ -148,8 +148,10 @@ def initialize(args: argparse.Namespace) -> None:
         "model": model,
         "base_url": base_url,
         "api_key_env": key_name,
-        "streaming": not args.no_streaming,
+        "streaming": args.streaming,
+        "max_tokens": args.max_tokens,
     }
+    ModelProfile(**profile, api_key=key)
     if provider == "openai" and urlsplit(base_url).hostname == "openrouter.ai":
         profile["summary_options"] = {"extra_body": {"reasoning": {"enabled": False}}}
     values = {
@@ -316,14 +318,30 @@ def run(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="localchat",
-        description="LocalChat: a local chat UI with a sandboxed ReAct agent.",
+        description=(
+            "LocalChat: a local chat UI with a sandboxed ReAct agent. "
+            "Supports OpenAI-compatible APIs and native GigaChat models. "
+            "Model requests run sequentially; a new request is rejected while busy."
+        ),
+        epilog=(
+            "GigaChat setup: localchat init --model gigachat:GigaChat-2 "
+            "--base-url https://api.giga.chat/v1. Use a ready access token. "
+            "New profiles default to streaming=false and max_tokens=128000."
+        ),
     )
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {version('local-agent-chat')}"
     )
     commands = parser.add_subparsers(dest="command", required=True)
     init = commands.add_parser(
-        "init", help="Create private model settings and a session secret."
+        "init",
+        help="Configure OpenAI-compatible or GigaChat models and a session secret.",
+        description=(
+            "Create private settings for OpenAI-compatible APIs or native GigaChat. "
+            "GigaChat example: --model gigachat:GigaChat-2 "
+            "--base-url https://api.giga.chat/v1. "
+            "Use GIGACHAT_ACCESS_TOKEN with a ready token, not OAuth credentials."
+        ),
     )
     init.add_argument(
         "--config-dir", help="Configuration directory (default: current directory)."
@@ -347,14 +365,33 @@ def main(argv: list[str] | None = None) -> int:
         help="Use a placeholder key for a local unauthenticated API.",
     )
     init.add_argument(
-        "--no-streaming", action="store_true", help="Disable streaming for this model."
+        "--streaming",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable streamed responses (default: disabled; --no-streaming also supported).",
+    )
+    init.add_argument(
+        "--max-tokens",
+        type=int,
+        default=AgentConfig().max_output_tokens,
+        help="Maximum response tokens saved in the model profile (default: 128000).",
     )
     init.add_argument(
         "--no-input",
         action="store_true",
         help="Require settings through arguments/environment; never prompt.",
     )
-    start = commands.add_parser("run", help="Start the UI using saved settings.")
+    start = commands.add_parser(
+        "run",
+        help="Start the UI with saved OpenAI-compatible or GigaChat settings.",
+        description=(
+            "Run OpenAI-compatible or native GigaChat models from models.yaml. "
+            "Requests are sequential across chats, summaries and titles. "
+            "A new request is rejected while busy. Transient errors get up to "
+            "10 retries with delays of 1, 2, 4, ... seconds, capped at 300 seconds. "
+            "LLM_MAX_RETRIES overrides the retry count; 0 disables retries."
+        ),
+    )
     start.add_argument(
         "--config-dir", help="Directory containing .env and models.yaml."
     )

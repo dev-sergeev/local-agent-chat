@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+from asyncio import sleep
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
 from langchain_openai import StreamChunkTimeoutError
 
 from .providers import ModelStreamTimeout, create_chat_model
+from .retry_policy import retry_delay
 from .settings import LLMRetryConfig, ModelProfile
 
 T = TypeVar("T")
@@ -24,6 +26,8 @@ _RESERVED_MODEL_ARGUMENTS = frozenset(
         "auth_url",
         "base_url",
         "max_retries",
+        "inference_retries",
+        "inference_timeout",
         "timeout",
         "stream_chunk_timeout",
     }
@@ -34,14 +38,21 @@ _RESERVED_MODEL_ARGUMENTS = frozenset(
 class RetryBlock:
     """Apply bounded recovery policies to every LLM model.
 
-    The provider SDK owns transient-error classification, backoff, and
-    `Retry-After` handling for one inference. A separate budget may resume a
-    model handler after a zero-chunk stream timeout. It never replays an Agent
-    graph, Turn, middleware side effect, or tool execution.
+    Provider adapters own backoff for one inference, with SDK retries disabled.
+    The shared lock serializes main, summary and title requests, including
+    retry delays. A separate budget resumes only zero-chunk stream timeouts.
+    No retry replays an Agent graph, Turn or completed tool execution.
     """
 
     config: LLMRetryConfig
     model_factory: ModelFactory = create_chat_model
+    _inference_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock, repr=False, compare=False
+    )
+
+    @property
+    def busy(self) -> bool:
+        return self._inference_lock.locked()
 
     def create_model(self, profile: ModelProfile, **kwargs: Any) -> Any:
         """Create a model whose provider retry behavior cannot be bypassed."""
@@ -69,7 +80,10 @@ class RetryBlock:
     async def run_auxiliary(self, awaitable_factory: Callable[[], Awaitable[T]]) -> T:
         """Run a non-Turn LLM operation inside one total timeout budget."""
 
-        async with asyncio.timeout(self.config.auxiliary_timeout_seconds):
+        async with (
+            self._inference_lock,
+            asyncio.timeout(self.config.auxiliary_timeout_seconds),
+        ):
             return await awaitable_factory()
 
     async def run_streaming_model(
@@ -77,11 +91,16 @@ class RetryBlock:
     ) -> T:
         """Retry only a model handler that timed out before its first chunk."""
 
-        retries = 0
-        while True:
-            try:
-                return await awaitable_factory()
-            except (StreamChunkTimeoutError, ModelStreamTimeout) as error:
-                if error.chunks_received != 0 or retries >= self.config.stream_retries:
-                    raise
-                retries += 1
+        async with self._inference_lock:
+            retries = 0
+            while True:
+                try:
+                    return await awaitable_factory()
+                except (StreamChunkTimeoutError, ModelStreamTimeout) as error:
+                    if (
+                        error.chunks_received != 0
+                        or retries >= self.config.stream_retries
+                    ):
+                        raise
+                    await sleep(retry_delay(retries))
+                    retries += 1

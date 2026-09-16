@@ -4,10 +4,38 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from local_agent_chat.settings import LLMRetryConfig, load_settings
+from local_agent_chat.settings import (
+    AgentConfig,
+    LLMRetryConfig,
+    ModelProfile,
+    load_settings,
+)
 
 
 class SettingsTest(unittest.TestCase):
+    def test_new_defaults_fit_large_output_and_disable_streaming(self) -> None:
+        profile = ModelProfile("giga", "GigaChat", "gigachat:GigaChat-2", "TOKEN", None)
+        self.assertFalse(profile.streaming)
+        self.assertEqual(profile.max_tokens, 128000)
+        self.assertEqual(AgentConfig().context_tokens, 160000)
+        self.assertEqual(AgentConfig().max_output_tokens, 128000)
+        self.assertEqual(LLMRetryConfig().max_retries, 10)
+
+    def test_rejects_invalid_profile_output_limits(self) -> None:
+        for value in (0, -1, True, "128000", 1.5, 1000001):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "max_tokens"),
+            ):
+                ModelProfile(
+                    "giga",
+                    "GigaChat",
+                    "gigachat:GigaChat-2",
+                    "TOKEN",
+                    None,
+                    max_tokens=value,
+                )
+
     def test_loads_public_root_and_model_profiles_without_secrets_in_yaml(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

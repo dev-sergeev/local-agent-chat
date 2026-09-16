@@ -1,18 +1,19 @@
-"""Provider construction and GigaChat's bounded asynchronous inference boundary."""
+"""Provider construction with bounded retries around a single inference."""
 
 from __future__ import annotations
 
 import asyncio
+from asyncio import sleep
 from contextlib import aclosing
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
 from gigachat.exceptions import ResponseError
-from langchain import chat_models
 from langchain_gigachat import GigaChat
+from langchain_openai import ChatOpenAI, StreamChunkTimeoutError
+from openai import APIConnectionError, APIStatusError
 
+from .retry_policy import retry_delay
 from .settings import parse_model
 
 
@@ -23,28 +24,21 @@ class ModelStreamTimeout(TimeoutError):
 
 
 def _transient(error: Exception) -> bool:
-    return isinstance(error, (httpx.TransportError, TimeoutError)) or (
-        isinstance(error, ResponseError)
-        and error.status_code in {408, 429, 500, 502, 503, 504}
+    return isinstance(
+        error, (httpx.TransportError, TimeoutError, APIConnectionError)
+    ) or (
+        isinstance(error, (ResponseError, APIStatusError))
+        and (error.status_code in {408, 409, 429} or 500 <= error.status_code < 600)
     )
 
 
 def _retry_delay(error: Exception, attempt: int) -> float:
-    if isinstance(error, ResponseError) and error.headers:
-        value = error.headers.get("retry-after")
-        if value:
-            try:
-                return max(0.0, min(60.0, float(value)))
-            except ValueError:
-                try:
-                    date = parsedate_to_datetime(value)
-                    return max(
-                        0.0,
-                        min(60.0, (date - datetime.now(timezone.utc)).total_seconds()),
-                    )
-                except (TypeError, ValueError, OverflowError):
-                    pass
-    return min(60.0, 0.5 * 2**attempt)
+    headers = None
+    if isinstance(error, ResponseError):
+        headers = error.headers
+    elif isinstance(error, APIStatusError):
+        headers = error.response.headers
+    return retry_delay(attempt, headers)
 
 
 def _raise_provider_error(error: Exception) -> None:
@@ -62,19 +56,65 @@ def _raise_provider_error(error: Exception) -> None:
     raise error
 
 
-class GigaChatModel(GigaChat):
-    """Keep SDK retries off: its stream retry can replay an emitted chunk.
+class _AsyncInferenceRetries:
+    """Own retries once, before output; SDK retries stay disabled."""
 
-    The application only uses async inference. HTTP retries live here, before
-    the first chunk; RetryBlock separately handles zero-chunk stalls. Neither
-    boundary can replay a graph or a completed tool call.
-    """
-
+    inference_retries: int = 10
+    inference_timeout: float = 60.0
     stream_chunk_timeout: float = 120.0
 
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        if kwargs.get("stream", self.streaming):
+            return await super()._agenerate(messages, stop, run_manager, **kwargs)
+        for attempt in range(self.inference_retries + 1):
+            try:
+                async with asyncio.timeout(self.inference_timeout):
+                    return await super()._agenerate(
+                        messages, stop, run_manager, **kwargs
+                    )
+            except Exception as error:
+                if not _transient(error) or attempt >= self.inference_retries:
+                    _raise_provider_error(error)
+                await sleep(_retry_delay(error, attempt))
+
+    async def _astream(self, messages, stop=None, run_manager=None, **kwargs):
+        chunks_received = 0
+        for attempt in range(self.inference_retries + 1):
+            try:
+                async with aclosing(
+                    super()._astream(messages, stop, run_manager, **kwargs)
+                ) as stream:
+                    while True:
+                        try:
+                            async with asyncio.timeout(self.stream_chunk_timeout):
+                                chunk = await anext(stream)
+                        except StopAsyncIteration:
+                            return
+                        except TimeoutError as error:
+                            raise ModelStreamTimeout(chunks_received) from error
+                        chunks_received += 1
+                        yield chunk
+            except (ModelStreamTimeout, StreamChunkTimeoutError):
+                raise
+            except Exception as error:
+                if (
+                    chunks_received
+                    or not _transient(error)
+                    or attempt >= self.inference_retries
+                ):
+                    _raise_provider_error(error)
+                await sleep(_retry_delay(error, attempt))
+
+
+class OpenAIModel(_AsyncInferenceRetries, ChatOpenAI):
+    """Use the same retry schedule for every OpenAI-compatible endpoint."""
+
+
+class GigaChatModel(_AsyncInferenceRetries, GigaChat):
+    """Use ready access tokens and normalize streaming usage from the SDK."""
+
     def _build_stream_chunk(self, chunk, first_chunk):
-        # The SDK emits None for absent cache usage, but LangChain's chunk
-        # aggregation requires an integer (the wrapper only handles missing keys).
+        # LangChain's aggregation requires integer cache usage, not SDK None.
         if usage := chunk.get("usage"):
             chunk = {
                 **chunk,
@@ -96,53 +136,14 @@ class GigaChatModel(GigaChat):
             "password": "",
         }
 
-    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
-        if kwargs.get("stream", self.streaming):
-            return await super()._agenerate(messages, stop, run_manager, **kwargs)
-        for attempt in range((self.max_retries or 0) + 1):
-            try:
-                async with asyncio.timeout(self.timeout):
-                    return await super()._agenerate(
-                        messages, stop, run_manager, **kwargs
-                    )
-            except Exception as error:
-                if not _transient(error) or attempt >= (self.max_retries or 0):
-                    _raise_provider_error(error)
-                await asyncio.sleep(_retry_delay(error, attempt))
-
-    async def _astream(self, messages, stop=None, run_manager=None, **kwargs):
-        chunks_received = 0
-        for attempt in range((self.max_retries or 0) + 1):
-            try:
-                async with aclosing(
-                    super()._astream(messages, stop, run_manager, **kwargs)
-                ) as stream:
-                    while True:
-                        try:
-                            async with asyncio.timeout(self.stream_chunk_timeout):
-                                chunk = await anext(stream)
-                        except StopAsyncIteration:
-                            return
-                        except TimeoutError as error:
-                            raise ModelStreamTimeout(chunks_received) from error
-                        chunks_received += 1
-                        yield chunk
-            except ModelStreamTimeout:
-                raise
-            except Exception as error:
-                if (
-                    chunks_received
-                    or not _transient(error)
-                    or attempt >= (self.max_retries or 0)
-                ):
-                    _raise_provider_error(error)
-                await asyncio.sleep(_retry_delay(error, attempt))
-
 
 def create_chat_model(model: str, **kwargs: Any):
     provider, model_id = parse_model(model)
+    kwargs["inference_retries"] = kwargs.pop("max_retries", 10)
+    kwargs["inference_timeout"] = kwargs.get("timeout", 60.0)
+    kwargs["max_retries"] = 0
     if provider == "openai":
-        return chat_models.init_chat_model(model, **kwargs)
+        return OpenAIModel(model=model_id, **kwargs)
     token = kwargs.pop("api_key", None)
     if not token:
         raise ValueError(

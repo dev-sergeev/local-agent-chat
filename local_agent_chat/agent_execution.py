@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from langchain.agents import create_agent
@@ -79,9 +80,15 @@ class AgentExecution:
         binding = self._binding(chat_id)
         if chat_id not in self._graphs:
             profile = self._models[binding.profile_id]
+            config = replace(
+                self._config,
+                max_output_tokens=min(
+                    profile.max_tokens, self._config.max_output_tokens
+                ),
+            )
             model = self._retry.create_model(
                 profile,
-                max_tokens=self._config.max_output_tokens,
+                max_tokens=config.max_output_tokens,
                 disable_streaming=not profile.streaming,
             )
             summary_model = self._retry.create_model(
@@ -95,8 +102,8 @@ class AgentExecution:
                 tools=build_sandbox_tools(self._sandbox.files_dir(chat_id)),
                 system_prompt=AGENT_SYSTEM_PROMPT,
                 middleware=[
-                    ContextSummary(summary_model, self._config, self._retry),
-                    ModelGuardrails(self._config, self._retry),
+                    ContextSummary(summary_model, config, self._retry),
+                    ModelGuardrails(config, self._retry),
                     ModelCallLimitMiddleware(
                         run_limit=self._config.max_model_calls,
                         exit_behavior="error",

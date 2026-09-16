@@ -4,7 +4,6 @@ from dataclasses import FrozenInstanceError
 
 import httpx
 import pytest
-from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage
 from langchain_openai import StreamChunkTimeoutError
 from openai import APIConnectionError, BadRequestError, InternalServerError
@@ -245,7 +244,6 @@ def _real_model_block(*, max_retries: int) -> RetryBlock:
             stream_chunk_timeout_seconds=1.0,
             auxiliary_timeout_seconds=5.0,
         ),
-        init_chat_model,
     )
 
 

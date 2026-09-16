@@ -53,11 +53,16 @@ class ChatRuntime:
         self._sandbox = sandbox
         self._history = history
         self._locks: dict[str, asyncio.Lock] = {}
+        self._turn_lock = asyncio.Lock()
         self._deleting: set[str] = set()
 
     def _enter_chat(self, chat_id: str) -> asyncio.Lock:
         if chat_id in self._deleting:
             raise RuntimeError("Chat is being deleted")
+        if self._turn_lock.locked():
+            raise RuntimeError(
+                "Another Turn is already running. Try again when it finishes."
+            )
         lock = self._locks.setdefault(chat_id, asyncio.Lock())
         if lock.locked():
             raise RuntimeError("Another Turn is already running for this Chat")
@@ -108,7 +113,7 @@ class ChatRuntime:
         text: str,
         emit: EventSink | None = None,
     ) -> str:
-        async with self._enter_chat(chat_id):
+        async with self._enter_chat(chat_id), self._turn_lock:
             if chat_id in self._deleting:
                 raise RuntimeError("Chat is being deleted")
             memory = await self._agent.checkpoint(chat_id)
@@ -160,7 +165,7 @@ class ChatRuntime:
     ) -> AsyncIterator[Callable[[], Awaitable[str]]]:
         """Keep runtime rollback data alive through the caller's UI commit."""
 
-        async with self._enter_chat(chat_id):
+        async with self._enter_chat(chat_id), self._turn_lock:
             if chat_id in self._deleting:
                 raise RuntimeError("Chat is being deleted")
             original = await self._history.get(turn_id)

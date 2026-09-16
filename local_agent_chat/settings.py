@@ -25,11 +25,14 @@ class ModelProfile:
     api_key_env: str
     api_key: str | None
     base_url: str | None = None
-    streaming: bool = True
+    streaming: bool = False
     summary_options: dict = field(default_factory=dict)
+    max_tokens: int = 128000
 
     def __post_init__(self) -> None:
         parse_model(self.model)
+        if type(self.max_tokens) is not int or not 1 <= self.max_tokens <= 1_000_000:
+            raise ValueError("max_tokens must be an integer from 1 to 1000000")
         if not isinstance(self.summary_options, dict):
             raise ValueError("summary_options must be a mapping of model arguments")
         if {
@@ -44,7 +47,7 @@ class ModelProfile:
 
 @dataclass(frozen=True)
 class LLMRetryConfig:
-    max_retries: int = 3
+    max_retries: int = 10
     stream_retries: int = 1
     request_timeout_seconds: float = 60.0
     stream_chunk_timeout_seconds: float = 120.0
@@ -53,11 +56,11 @@ class LLMRetryConfig:
 
 @dataclass(frozen=True)
 class AgentConfig:
-    context_tokens: int = 16000
+    context_tokens: int = 160000
     summary_trigger_tokens: int = 10000
     keep_tokens: int = 3000
     summary_tokens: int = 1000
-    max_output_tokens: int = 2000
+    max_output_tokens: int = 128000
     max_model_calls: int = 12
 
     def __post_init__(self) -> None:
@@ -172,7 +175,7 @@ def load_settings() -> Settings:
         if item["id"] in identifiers:
             raise ValueError("Model profile ids must be unique.")
         identifiers.add(item["id"])
-        if type(item.get("streaming", True)) is not bool:
+        if type(item.get("streaming", False)) is not bool:
             raise ValueError(f"Model profile {index}: streaming must be true or false.")
         if item.get("base_url") is not None and not isinstance(item["base_url"], str):
             raise ValueError(f"Model profile {index}: base_url must be a URL string.")
@@ -184,8 +187,9 @@ def load_settings() -> Settings:
             api_key_env=item["api_key_env"],
             api_key=os.environ.get(item["api_key_env"]),
             base_url=item.get("base_url"),
-            streaming=item.get("streaming", True),
+            streaming=item.get("streaming", False),
             summary_options=item.get("summary_options", {}),
+            max_tokens=item.get("max_tokens", 128000),
         )
         for item in document.get("models", [])
     )

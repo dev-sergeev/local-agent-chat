@@ -74,6 +74,9 @@ async def chat(tmp_path, monkeypatch, request):
     monkeypatch.setitem(
         sio.handlers["/"], "edit_message", sio.handlers["/"]["edit_message"]
     )
+    monkeypatch.setitem(
+        sio.handlers["/"], "client_message", sio.handlers["/"]["client_message"]
+    )
     spec = importlib.util.spec_from_file_location(
         "_revision_lifecycle_app", Path("local_agent_chat/app.py")
     )
@@ -227,9 +230,13 @@ async def test_socket_edit_registers_the_task_stopped_by_chainlit(chat, monkeypa
     app, agent, emitter = chat
     session = emitter.session
     monkeypatch.setattr(WebsocketSession, "require", lambda _sid: session)
+    import local_agent_chat.chainlit_requests as requests_adapter
     import local_agent_chat.chainlit_revision as adapter
 
     monkeypatch.setattr(adapter, "init_ws_context", lambda _session: context_var.get())
+    monkeypatch.setattr(
+        requests_adapter, "init_ws_context", lambda _session: context_var.get()
+    )
     await sio.handlers["/"]["edit_message"](
         "socket", {"message": {"id": "turn-3", "output": "wait"}}
     )
@@ -338,9 +345,13 @@ async def test_busy_socket_edit_preserves_running_task_and_restores_ui(
     app, agent, emitter = chat
     session = emitter.session
     monkeypatch.setattr(WebsocketSession, "require", lambda _sid: session)
+    import local_agent_chat.chainlit_requests as requests_adapter
     import local_agent_chat.chainlit_revision as adapter
 
     monkeypatch.setattr(adapter, "init_ws_context", lambda _session: context_var.get())
+    monkeypatch.setattr(
+        requests_adapter, "init_ws_context", lambda _session: context_var.get()
+    )
     running = asyncio.create_task(asyncio.Event().wait())
     session.current_task = running
     try:

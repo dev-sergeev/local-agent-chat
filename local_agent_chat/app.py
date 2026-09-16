@@ -19,6 +19,7 @@ from local_agent_chat.agent_execution import AgentExecution
 from local_agent_chat.auxiliary_labels import AuxiliaryLabels
 from local_agent_chat.chainlit_data import create_chainlit_data_layer
 from local_agent_chat.chainlit_persistence import step_writes
+from local_agent_chat.chainlit_requests import install_request_guard
 from local_agent_chat.chainlit_revision import (
     install_revision_handler,
     sync_chat_history,
@@ -443,6 +444,7 @@ async def on_edit_message(payload: dict) -> None:
 
 
 install_revision_handler(chainlit_layer, on_edit_message)
+install_request_guard(chainlit_layer, lambda: retry_block.busy)
 
 
 @router.get("/files/{object_key:path}", include_in_schema=False)

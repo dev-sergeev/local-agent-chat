@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -77,6 +78,28 @@ def make_runtime(root: Path, *, config=AgentConfig(), model=None, summary=None):
         model,
         summary,
     )
+
+
+@pytest.mark.parametrize("output_limit", [128000, 4096])
+async def test_profile_output_limit_reaches_main_model_without_changing_summary(
+    tmp_path, output_limit
+):
+    runtime, execution, _history, model, summary = make_runtime(tmp_path)
+    profile = execution._models["test"]
+    execution._models["test"] = replace(profile, max_tokens=output_limit)
+    calls = []
+
+    def factory(_model, **kwargs):
+        calls.append(kwargs)
+        return summary if kwargs["max_tokens"] == 1000 else model
+
+    execution._retry = RetryBlock(LLMRetryConfig(), factory)
+    try:
+        await runtime.submit("chat", "turn", "hello")
+        assert [call["max_tokens"] for call in calls] == [output_limit, 1000]
+        assert all(call["disable_streaming"] for call in calls)
+    finally:
+        await execution.close()
 
 
 @pytest.mark.parametrize("edited_turn", [1, 2, 25, 26, 50, 75, 99, 100])

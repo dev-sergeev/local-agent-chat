@@ -8,6 +8,7 @@ All provider requests go to a deterministic local OpenAI/GigaChat test server.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -30,6 +31,9 @@ import socketio
 
 
 class Provider(BaseHTTPRequestHandler):
+    blocked = threading.Event()
+    release = threading.Event()
+
     def log_message(self, *_args):
         pass
 
@@ -37,6 +41,11 @@ class Provider(BaseHTTPRequestHandler):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         messages = request["messages"]
         latest = next(m["content"] for m in reversed(messages) if m["role"] == "user")
+        if latest == "hold response":
+            self.blocked.set()
+            assert self.release.wait(20), (
+                "Concurrent-request check did not release the provider"
+            )
         message = {"role": "assistant", "content": "Answer: " + str(latest)}
         finish = "stop"
         if (
@@ -142,12 +151,14 @@ class Chat:
         self.session_id = str(uuid.uuid4())
         self.thread = thread
         self.resumed = None
+        self.toasts = []
         self.ended = threading.Event()
         self.ready = threading.Event()
         self.http = requests.Session()
         self.http.post(root + "/auth/header", timeout=10).raise_for_status()
         self.ws = socketio.Client(http_session=self.http, reconnection=False)
         self.ws.on("task_end", lambda *_: self.ended.set())
+        self.ws.on("toast", lambda payload: self.toasts.append(payload))
         self.ws.on("chat_settings", lambda *_: self.ready.set())
         self.ws.on("first_interaction", self._thread)
         self.ws.on("resume_thread", self._resume)
@@ -375,6 +386,40 @@ def check(wheel: Path, work: Path):
                     expected.append(chat.send(f"request-{index}"))
                 turns = verify_history(data, chat.thread, expected)
                 assert "PACKAGE-CANARY" in turns[0][2]
+                # Attempt an overlapping request through a different real
+                # WebSocket. The rejected text must never reach either history.
+                peer = Chat(root, prefix)
+                Provider.blocked.clear()
+                Provider.release.clear()
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                        pending = pool.submit(chat.send, "hold response")
+                        try:
+                            assert Provider.blocked.wait(10), (
+                                "Provider did not receive the first request"
+                            )
+                            rejected_id, _ = peer.send("this request must be rejected")
+                            assert peer.toasts and "Модель занята" in json.dumps(
+                                peer.toasts, ensure_ascii=False
+                            )
+                            for filename, table in (
+                                ("runtime-history.sqlite3", "turns"),
+                                ("chainlit.sqlite3", "steps"),
+                            ):
+                                with closing(sqlite3.connect(data / filename)) as db:
+                                    assert (
+                                        db.execute(
+                                            f"SELECT COUNT(*) FROM {table} WHERE id=?",
+                                            (rejected_id,),
+                                        ).fetchone()[0]
+                                        == 0
+                                    )
+                        finally:
+                            Provider.release.set()
+                        expected.append(pending.result(timeout=10))
+                    verify_history(data, chat.thread, expected)
+                finally:
+                    peer.close()
                 expected = expected[:3]
                 expected[2] = chat.send("revised-third", edit_id=expected[2][0])
                 verify_history(data, chat.thread, expected)
@@ -510,6 +555,7 @@ def check(wheel: Path, work: Path):
                         "reinstallation",
                         "moved project directory",
                         "native GigaChat tools",
+                        "concurrent requests rejected before persistence",
                         "resume",
                         "edit first request",
                         "SQLite integrity",

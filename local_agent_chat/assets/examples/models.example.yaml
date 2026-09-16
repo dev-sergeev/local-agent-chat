@@ -4,7 +4,8 @@ models:
     model: openai:deepseek/deepseek-v4-flash-0731
     base_url: https://openrouter.ai/api/v1
     api_key_env: OPENAI_API_KEY
-    streaming: true
+    streaming: false
+    max_tokens: 128000
     summary_options:
       extra_body:
         reasoning:
@@ -16,4 +17,5 @@ models:
 #    model: gigachat:GigaChat-2
 #    base_url: https://api.giga.chat/v1
 #    api_key_env: GIGACHAT_ACCESS_TOKEN
-#    streaming: true
+#    streaming: false
+#    max_tokens: 128000

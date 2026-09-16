@@ -68,7 +68,7 @@ async def test_chat_label_uses_profile_retry_policy_and_cached_model(
             {
                 "api_key": "key",
                 "max_tokens": 32,
-                "max_retries": 3,
+                "max_retries": 10,
                 "reasoning_effort": "none",
                 "stream_chunk_timeout": 120.0,
                 "timeout": 60.0,

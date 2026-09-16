@@ -83,6 +83,8 @@ def test_interactive_init_generates_model_and_secret(isolated_env, monkeypatch):
     assert profile["model"] == "openai:my-local-model"
     assert profile["base_url"] == "http://localhost:9000/v1"
     assert "summary_options" not in profile
+    assert profile["streaming"] is False
+    assert profile["max_tokens"] == 128000
 
 
 def test_noninteractive_init_requires_key_or_explicit_local_mode(isolated_env, capsys):
@@ -95,6 +97,22 @@ def test_noninteractive_init_requires_key_or_explicit_local_mode(isolated_env, c
         "models"
     ][0]
     assert profile["streaming"] is False
+
+
+def test_init_can_override_output_limit_and_enable_streaming(isolated_env):
+    assert (
+        main(init_arguments() + ["--no-api-key", "--streaming", "--max-tokens", "4096"])
+        == 0
+    )
+    profile = yaml.safe_load((isolated_env / "models.yaml").read_text())["models"][0]
+    assert profile["streaming"] is True
+    assert profile["max_tokens"] == 4096
+
+
+@pytest.mark.parametrize("limit", ["0", "-1", "1000001"])
+def test_invalid_output_limit_leaves_no_configuration(isolated_env, limit):
+    assert main(init_arguments() + ["--no-api-key", "--max-tokens", limit]) == 2
+    assert list(isolated_env.iterdir()) == []
 
 
 def test_run_reports_missing_config_without_creating_chainlit_files(
@@ -184,7 +202,7 @@ def test_runtime_refreshes_assets_keeps_data_and_excludes_concurrent_process(tmp
 
 
 def test_help_and_version_do_not_initialize_chainlit(tmp_path):
-    for arguments in (["--help"], ["--version"], ["run", "--help"]):
+    for arguments in (["--help"], ["--version"], ["init", "--help"], ["run", "--help"]):
         result = subprocess.run(
             [sys.executable, "-m", "local_agent_chat", *arguments],
             cwd=tmp_path,
@@ -193,6 +211,8 @@ def test_help_and_version_do_not_initialize_chainlit(tmp_path):
         )
         assert result.returncode == 0, result.stderr
         assert "localchat" in result.stdout
+        if "--help" in arguments:
+            assert "GigaChat" in result.stdout
     assert list(tmp_path.iterdir()) == []
 
 
@@ -223,6 +243,8 @@ def test_init_provider_and_local_directory(isolated_env, monkeypatch, model, key
     assert profile["model"] == model
     assert profile["api_key_env"] == key_name
     assert profile["base_url"] == "https://models.example/v1"
+    assert profile["streaming"] is False
+    assert profile["max_tokens"] == 128000
     assert env[key_name] == "test-token"
     assert "test-token" not in (isolated_env / "models.yaml").read_text()
 

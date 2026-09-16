@@ -83,8 +83,12 @@ class ChatRuntimeTest(unittest.IsolatedAsyncioTestCase):
         await started.wait()
         with self.assertRaisesRegex(RuntimeError, "already running"):
             await runtime.submit("chat-1", "turn-2", "second")
+        with self.assertRaisesRegex(RuntimeError, "already running"):
+            await runtime.submit("chat-2", "turn-3", "another chat")
         release.set()
         await first
+        await runtime.submit("chat-2", "turn-3", "after completion")
+        self.assertEqual([turn.id for turn in history.turns], ["turn-1", "turn-3"])
 
     async def test_revision_restores_both_states_then_reruns_agent(self) -> None:
         agent = RecordingAgent()
