@@ -7,7 +7,7 @@ import pytest
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage
 from langchain_openai import StreamChunkTimeoutError
-from openai import BadRequestError, InternalServerError
+from openai import APIConnectionError, BadRequestError, InternalServerError
 
 from local_agent_chat.agent_context import ContextSummary
 from local_agent_chat.llm_retry import RetryBlock
@@ -360,9 +360,16 @@ async def test_openai_provider_does_not_restart_a_started_stream() -> None:
         model = _real_model_block(max_retries=3).create_model(
             _profile(), http_async_client=client
         )
-        with pytest.raises(httpx.ReadError, match="stream disconnected"):
+        # Newer SDKs wrap transport failures in APIConnectionError; older
+        # versions propagate ReadError directly. Both must preserve no replay.
+        with pytest.raises((httpx.ReadError, APIConnectionError)) as failure:
             async for chunk in model.astream("hello"):
                 received.append(str(chunk.content))
 
+    cause = failure.value
+    while cause.__cause__ is not None:
+        cause = cause.__cause__
+    assert isinstance(cause, httpx.ReadError)
+    assert str(cause) == "stream disconnected"
     assert received == ["partial"]
     assert requests == 1
