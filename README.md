@@ -10,7 +10,7 @@
 
 Требуются Python **3.12–3.13**, Linux (или WSL2) и модель с tool calling: OpenAI-compatible API или GigaChat. Пакет содержит UI, переводы и все ресурсы приложения; клонировать репозиторий для запуска не нужно. Windows без WSL не поддерживается из-за требований файловой песочницы. macOS пока не входит в проверяемые платформы.
 
-После публикации в PyPI установите приложение через [pipx](https://pipx.pypa.io/stable/installation/):
+Установите приложение из PyPI через [pipx](https://pipx.pypa.io/stable/installation/):
 
 ```bash
 pipx install --python python3.12 local-agent-chat
@@ -20,7 +20,7 @@ localchat run
 
 `init` запросит модель, адрес API и ключ или готовый access token. Запускайте команды в папке, где хотите хранить настройки и историю. Для OpenAI-compatible endpoint имя модели имеет вид `openai:<model-id>`, например `openai:deepseek/deepseek-v4-flash-0731` для OpenRouter. Для GigaChat используйте `gigachat:GigaChat-2` и base URL его API. Ключ вводится без отображения в терминале; секрет сессии создаётся автоматически. `run` покажет адрес UI, по умолчанию **http://127.0.0.1:8765/**. Остановка — `Ctrl+C`; `--open-browser` открывает браузер автоматически.
 
-До первого релиза можно установить собранный wheel: `pipx install --python python3.12 ./dist/local_agent_chat-0.1.0-py3-none-any.whl`. Альтернатива pipx — `python3.12 -m venv .venv`, активация окружения и `python -m pip install local-agent-chat`.
+Можно также установить собранный wheel: `pipx install --python python3.12 ./dist/local_agent_chat-0.1.1-py3-none-any.whl`. Альтернатива pipx — `python3.12 -m venv .venv`, активация окружения и `python -m pip install local-agent-chat`.
 
 Для локального API без ключа:
 
