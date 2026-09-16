@@ -106,7 +106,9 @@ def initialize(args: argparse.Namespace) -> None:
         "APP_HOST": "127.0.0.1",
         "APP_PORT": "8765",
         "APP_ROOT_PATH": "",
-        "APP_DATA_DIR": str(_path(args.data_dir or data_directory(), Path.cwd())),
+        "APP_DATA_DIR": args.data_dir
+        or os.environ.get("APP_DATA_DIR")
+        or ".local-agent-chat",
         "MODEL_PROFILES_FILE": "models.yaml",
         "CHAINLIT_AUTH_SECRET": secrets.token_urlsafe(48),
         key_name: key,
@@ -119,6 +121,9 @@ def initialize(args: argparse.Namespace) -> None:
         f"{name}={_quote(value)}\n" for name, value in values.items()
     )
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _path(values["APP_DATA_DIR"], directory).mkdir(
+        parents=True, exist_ok=True, mode=0o700
+    )
     _write_private(
         directory / "models.yaml",
         yaml.safe_dump({"models": [profile]}, sort_keys=False, allow_unicode=True),
@@ -158,12 +163,15 @@ def run(args: argparse.Namespace) -> int:
                     file_values[binding.key] = binding.value
         for name, value in file_values.items():
             os.environ.setdefault(name, value)
+    os.environ["LOCALCHAT_CONFIG_DIR"] = str(directory)
     os.environ["MODEL_PROFILES_FILE"] = str(
         _path(os.environ.get("MODEL_PROFILES_FILE", "models.yaml"), directory)
     )
     os.environ["APP_DATA_DIR"] = str(
         _path(
-            args.data_dir or os.environ.get("APP_DATA_DIR") or data_directory(),
+            args.data_dir
+            or os.environ.get("APP_DATA_DIR")
+            or data_directory(directory),
             directory,
         )
     )
@@ -274,10 +282,10 @@ def main(argv: list[str] | None = None) -> int:
         "init", help="Create private model settings and a session secret."
     )
     init.add_argument(
-        "--config-dir", help="Configuration directory (default: user config directory)."
+        "--config-dir", help="Configuration directory (default: current directory)."
     )
     init.add_argument(
-        "--data-dir", help="Persistent data directory (default: user data directory)."
+        "--data-dir", help="Data directory (default: .local-agent-chat beside .env)."
     )
     init.add_argument(
         "--model", help="OpenAI-compatible identifier, e.g. openai:your-model."

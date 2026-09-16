@@ -194,13 +194,13 @@ class Chat:
 
 @contextmanager
 def service(executable, config, port, prefix, outside, env, log_path):
+    config_arguments = [] if config == outside else ["--config-dir", str(config)]
     with log_path.open("w") as log:
         process = subprocess.Popen(
             [
                 str(executable),
                 "run",
-                "--config-dir",
-                str(config),
+                *config_arguments,
                 "--port",
                 str(port),
                 "--root-path",
@@ -312,8 +312,8 @@ def check(wheel: Path, work: Path):
     )
     provider = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
     threading.Thread(target=provider.serve_forever, daemon=True).start()
-    config = work / "config/localchat"
-    data = work / "data/localchat"
+    config = outside
+    data = outside / ".local-agent-chat"
     try:
         subprocess.run(
             [
@@ -388,6 +388,12 @@ def check(wheel: Path, work: Path):
             stdout=subprocess.DEVNULL,
         )
         assert (config / ".env").read_bytes() == original_config
+        # Relative configuration must survive moving a complete Chat directory.
+        moved = work / "moved-project"
+        outside.rename(moved)
+        outside.mkdir()
+        config = moved
+        data = moved / ".local-agent-chat"
         with service(
             executable,
             config,
@@ -419,9 +425,14 @@ def check(wheel: Path, work: Path):
                     )
             finally:
                 chat.close()
-        assert not list(outside.iterdir()), (
-            "Application wrote into its current directory"
-        )
+        assert {path.name for path in config.iterdir()} == {
+            ".env",
+            "models.yaml",
+            ".local-agent-chat",
+        }
+        assert not list(outside.iterdir())
+        assert not (work / "config").exists()
+        assert not (work / "data").exists()
         assert not list(data.glob(".runtime-*"))
         for log in work.glob("server-*.log"):
             text = log.read_text()
@@ -446,6 +457,7 @@ def check(wheel: Path, work: Path):
                         "five-turn history",
                         "edit third request",
                         "reinstallation",
+                        "moved project directory",
                         "resume",
                         "edit first request",
                         "SQLite integrity",

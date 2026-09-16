@@ -9,24 +9,19 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from platformdirs import user_config_path, user_data_path
-
 ASSETS = Path(__file__).resolve().parent / "assets"
 
 
 def config_directory() -> Path:
     return (
-        Path(
-            os.environ.get("LOCALCHAT_CONFIG_DIR")
-            or user_config_path("localchat", appauthor=False)
-        )
+        Path(os.environ.get("LOCALCHAT_CONFIG_DIR") or Path.cwd())
         .expanduser()
         .resolve()
     )
 
 
-def data_directory() -> Path:
-    return Path(user_data_path("localchat", appauthor=False)).resolve()
+def data_directory(directory: Path | None = None) -> Path:
+    return ((directory or config_directory()) / ".local-agent-chat").resolve()
 
 
 def copy_ui(destination: Path) -> None:

@@ -142,9 +142,12 @@ def _llm_retry_config() -> LLMRetryConfig:
 
 def load_settings() -> Settings:
     llm_retry = _llm_retry_config()
+    directory = config_directory()
     profiles_path = Path(
-        os.environ.get("MODEL_PROFILES_FILE") or config_directory() / "models.yaml"
-    )
+        os.environ.get("MODEL_PROFILES_FILE") or "models.yaml"
+    ).expanduser()
+    if not profiles_path.is_absolute():
+        profiles_path = directory / profiles_path
     try:
         document = yaml.safe_load(profiles_path.read_text(encoding="utf-8"))
     except yaml.YAMLError as error:
@@ -181,10 +184,14 @@ def load_settings() -> Settings:
     if not profiles:
         raise ValueError("At least one Model Profile must be configured")
 
-    data_dir = Path(os.environ.get("APP_DATA_DIR") or data_directory()).resolve()
+    data_dir = Path(
+        os.environ.get("APP_DATA_DIR") or data_directory(directory)
+    ).expanduser()
+    if not data_dir.is_absolute():
+        data_dir = directory / data_dir
     return Settings(
         root_path=_root_path(os.environ.get("APP_ROOT_PATH", "")),
-        data_dir=data_dir,
+        data_dir=data_dir.resolve(),
         models=profiles,
         llm_retry=llm_retry,
         agent=AgentConfig(

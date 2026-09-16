@@ -39,6 +39,7 @@ def test_init_preserves_literal_secrets_and_existing_configuration(
     isolated_env, monkeypatch, capsys
 ):
     secret = "private-key-with-'quotes'-and-${HOME}-and-\\slash"
+    directory_mode = stat.S_IMODE(isolated_env.stat().st_mode)
     monkeypatch.setenv("OPENAI_API_KEY", secret)
     assert main(init_arguments()) == 0
     directory = config_directory()
@@ -47,9 +48,13 @@ def test_init_preserves_literal_secrets_and_existing_configuration(
     settings = dotenv_values(env_file, interpolate=False)
     assert settings["OPENAI_API_KEY"] == secret
     assert len(settings["CHAINLIT_AUTH_SECRET"]) >= 32
-    assert settings["APP_DATA_DIR"] == str(isolated_env / "data/localchat")
+    assert directory == isolated_env
+    assert settings["APP_DATA_DIR"] == ".local-agent-chat"
+    assert (directory / ".local-agent-chat").is_dir()
+    assert not (isolated_env / "config").exists()
+    assert not (isolated_env / "data").exists()
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
-    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    assert stat.S_IMODE(directory.stat().st_mode) == directory_mode
     assert secret not in (directory / "models.yaml").read_text()
     assert main(init_arguments()) == 2
     assert env_file.read_bytes() == before
@@ -72,7 +77,8 @@ def test_interactive_init_generates_model_and_secret(isolated_env, monkeypatch):
 def test_noninteractive_init_requires_key_or_explicit_local_mode(isolated_env, capsys):
     assert main(init_arguments()) == 2
     assert "OPENAI_API_KEY" in capsys.readouterr().err
-    assert not config_directory().exists()
+    assert not (config_directory() / ".env").exists()
+    assert not (config_directory() / "models.yaml").exists()
     assert main(init_arguments() + ["--no-api-key", "--no-streaming"]) == 0
     profile = yaml.safe_load((config_directory() / "models.yaml").read_text())[
         "models"
@@ -177,3 +183,41 @@ def test_help_and_version_do_not_initialize_chainlit(tmp_path):
         assert result.returncode == 0, result.stderr
         assert "localchat" in result.stdout
     assert list(tmp_path.iterdir()) == []
+
+
+def test_init_custom_directory_and_data_are_relative_to_config(isolated_env):
+    assert (
+        main(
+            init_arguments()
+            + ["--no-api-key", "--config-dir", "project", "--data-dir", "state"]
+        )
+        == 0
+    )
+    directory = isolated_env / "project"
+    assert (directory / "state").is_dir()
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    assert stat.S_IMODE((directory / "models.yaml").stat().st_mode) == 0o600
+    assert dotenv_values(directory / ".env")["APP_DATA_DIR"] == "state"
+
+
+def test_two_projects_and_moved_configuration_are_independent(
+    isolated_env, monkeypatch
+):
+    from local_agent_chat.settings import load_settings
+
+    for name in ("first", "second"):
+        assert main(init_arguments() + ["--no-api-key", "--config-dir", name]) == 0
+    first = isolated_env / "first"
+    second = isolated_env / "second"
+    moved = isolated_env / "moved"
+    (first / ".local-agent-chat" / "existing.sqlite3").write_bytes(b"persisted")
+    first.rename(moved)
+    assert (
+        dotenv_values(moved / ".env")["CHAINLIT_AUTH_SECRET"]
+        != dotenv_values(second / ".env")["CHAINLIT_AUTH_SECRET"]
+    )
+    monkeypatch.setenv("LOCALCHAT_CONFIG_DIR", str(moved))
+    settings = load_settings()
+    assert settings.data_dir == moved / ".local-agent-chat"
+    assert (settings.data_dir / "existing.sqlite3").read_bytes() == b"persisted"
+    assert not (second / ".local-agent-chat" / "existing.sqlite3").exists()

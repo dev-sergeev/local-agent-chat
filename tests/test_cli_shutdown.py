@@ -79,7 +79,7 @@ def test_cli_signal_runs_final_cleanup(tmp_path, stop_signal):
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=5)
-    data = tmp_path / "data/localchat"
+    data = tmp_path / ".local-agent-chat"
     assert list(data.glob("*.sqlite3")), "Persistent data should survive shutdown"
     assert list(data.glob(".runtime-*")) == [], (
         f"Temporary workspace survived signal {stop_signal}; process returned {process.returncode}"
