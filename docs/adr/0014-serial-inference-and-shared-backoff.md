@@ -1,0 +1,3 @@
+# Serialize provider inference and own the retry schedule
+
+All models use one application-owned asynchronous retry policy with ten retries, delays starting at one second and doubling to a five-minute cap; SDK retries are disabled so provider-specific schedules cannot multiply attempts or replay output. A shared inference lock covers primary, summary and title requests, including backoff, while user messages and Revisions are rejected before persistence whenever another request is active. This replaces ADR 0006's SDK-owned backoff while retaining its single-inference boundary and no-replay rule; asynchronous I/O is retained for responsive cancellation, not parallel model calls.

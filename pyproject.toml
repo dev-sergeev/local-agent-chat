@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "local-agent-chat"
-version = "0.1.1"
-description = "Local chat UI with persistent history and a sandboxed ReAct agent"
+version = "0.2.0"
+description = "Local chat UI for OpenAI-compatible and GigaChat models with persistent history"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.14"
 authors = [{name = "dev-sergeev"}]
-keywords = ["chat", "llm", "chainlit", "react-agent", "localchat"]
+keywords = ["chat", "llm", "chainlit", "react-agent", "localchat", "gigachat"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Environment :: Web Environment",
