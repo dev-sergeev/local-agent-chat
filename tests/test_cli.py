@@ -1,3 +1,4 @@
+import errno
 import os
 import stat
 import subprocess
@@ -60,6 +61,7 @@ def test_init_preserves_literal_secrets_and_existing_configuration(
     assert len(settings["CHAINLIT_AUTH_SECRET"]) >= 32
     assert directory == isolated_env
     assert settings["APP_DATA_DIR"] == ".local-agent-chat"
+    assert settings["APP_GENERATE_CHAT_TITLES"] == "false"
     assert settings["APP_ROOT_PATH"] == "auto"
     assert (directory / ".local-agent-chat").is_dir()
     assert not (isolated_env / "config").exists()
@@ -124,17 +126,25 @@ def test_run_reports_missing_config_without_creating_chainlit_files(
     assert not (isolated_env / ".files").exists()
 
 
+@pytest.mark.parametrize("data_setting", [None, "", ".localchat", "relative-data"])
+@pytest.mark.parametrize("explicit_config", [False, True])
 def test_run_resolves_paths_from_config_and_environment_overrides(
-    isolated_env, monkeypatch
+    isolated_env, monkeypatch, data_setting, explicit_config
 ):
     from argparse import Namespace
 
     from local_agent_chat import cli
+    from local_agent_chat.settings import load_settings
 
     assert main(init_arguments() + ["--no-api-key"]) == 0
     directory = config_directory()
-    with (directory / ".env").open("a") as output:
-        output.write("APP_DATA_DIR='relative-data'\n")
+    if data_setting is not None:
+        with (directory / ".env").open("a") as output:
+            output.write(f"APP_DATA_DIR='{data_setting}'\n")
+    if explicit_config:
+        elsewhere = isolated_env / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
     monkeypatch.setenv("APP_PORT", "9876")
     monkeypatch.setenv("OPENAI_API_KEY", "override-key")
     captured = {}
@@ -150,7 +160,7 @@ def test_run_resolves_paths_from_config_and_environment_overrides(
     with pytest.raises(CheckedStop):
         cli.run(
             Namespace(
-                config_dir=None,
+                config_dir=str(directory) if explicit_config else None,
                 data_dir=None,
                 host=None,
                 port=None,
@@ -159,7 +169,11 @@ def test_run_resolves_paths_from_config_and_environment_overrides(
             )
         )
     assert captured["MODEL_PROFILES_FILE"] == str(directory / "models.yaml")
-    assert captured["APP_DATA_DIR"] == str(directory / "relative-data")
+    assert captured["APP_DATA_DIR"] == str(
+        directory / (data_setting or ".local-agent-chat")
+    )
+    # The child reads these values again after CLI initialization.
+    assert load_settings().data_dir == directory / (data_setting or ".local-agent-chat")
     assert captured["APP_PORT"] == "9876"
     assert captured["OPENAI_API_KEY"] == "override-key"
     assert captured["APP_ROOT_PATH"] == "/proxy/9876"
@@ -181,7 +195,16 @@ def test_invalid_startup_settings_have_actionable_errors(
     assert "Traceback" not in capsys.readouterr().err
 
 
-def test_runtime_refreshes_assets_keeps_data_and_excludes_concurrent_process(tmp_path):
+@pytest.mark.parametrize("lock_error", [None, errno.ENOLCK, errno.EOPNOTSUPP])
+def test_runtime_refreshes_assets_keeps_data_and_excludes_concurrent_process(
+    tmp_path, monkeypatch, lock_error
+):
+    if lock_error is not None:
+
+        def unavailable(*_args):
+            raise OSError(lock_error, os.strerror(lock_error))
+
+        monkeypatch.setattr("fcntl.flock", unavailable)
     data = tmp_path / "data"
     data.mkdir()
     history = data / "existing.sqlite3"
@@ -199,6 +222,68 @@ def test_runtime_refreshes_assets_keeps_data_and_excludes_concurrent_process(tmp
         assert not root.exists()
     assert roots[0] != roots[1]
     assert history.read_bytes() == b"existing data"
+
+
+def test_runtime_lock_excludes_processes_with_different_flock_support(
+    tmp_path, monkeypatch
+):
+    import fcntl
+
+    flock = fcntl.flock
+
+    def unavailable(*_args):
+        raise OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+
+    monkeypatch.setattr(fcntl, "flock", unavailable)
+    with runtime_workspace(tmp_path):
+        monkeypatch.setattr(fcntl, "flock", flock)
+        with pytest.raises(ValueError, match="Another LocalChat"):
+            with runtime_workspace(tmp_path):
+                pass
+    with runtime_workspace(tmp_path):
+        monkeypatch.setattr(fcntl, "flock", unavailable)
+        with pytest.raises(ValueError, match="Another LocalChat"):
+            with runtime_workspace(tmp_path):
+                pass
+
+
+@pytest.mark.parametrize("during_setup", [False, True])
+def test_runtime_releases_directory_lock_after_failure(
+    tmp_path, monkeypatch, during_setup
+):
+    def fail_copy(_destination):
+        raise RuntimeError("copy failed")
+
+    with monkeypatch.context() as patch:
+        if during_setup:
+            patch.setattr("local_agent_chat.installation.copy_ui", fail_copy)
+        with pytest.raises(RuntimeError):
+            with runtime_workspace(tmp_path):
+                raise RuntimeError("runtime failed")
+    assert not (tmp_path / ".localchat.lock.d").exists()
+    assert not list(tmp_path.glob(".runtime-*"))
+    with runtime_workspace(tmp_path):
+        pass
+
+
+def test_runtime_reports_stale_directory_lock_without_removing_it(tmp_path):
+    guard = tmp_path / ".localchat.lock.d"
+    guard.mkdir()
+    with pytest.raises(ValueError, match="If all instances are stopped"):
+        with runtime_workspace(tmp_path):
+            pass
+    assert guard.is_dir()
+
+
+def test_runtime_does_not_ignore_unrelated_lock_errors(tmp_path, monkeypatch):
+    def denied(*_args):
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr("fcntl.flock", denied)
+    with pytest.raises(PermissionError):
+        with runtime_workspace(tmp_path):
+            pass
+    assert not (tmp_path / ".localchat.lock.d").exists()
 
 
 def test_help_and_version_do_not_initialize_chainlit(tmp_path):

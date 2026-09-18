@@ -203,7 +203,7 @@ def _thread_id() -> str:
 
 
 async def _publish_chat_title(chat_id: str, request_text: str) -> None:
-    """Persist and publish a semantic title without affecting the Turn."""
+    """Publish the request prefix, optionally replaced by a model-generated title."""
 
     try:
         await chainlit_layer.wait_for_initial_name(chat_id)
@@ -214,7 +214,11 @@ async def _publish_chat_title(chat_id: str, request_text: str) -> None:
             "first_interaction",
             {"interaction": fallback_title, "thread_id": chat_id},
         )
-        title = await auxiliary_labels.describe_chat(chat_id, request_text)
+        title = (
+            await auxiliary_labels.describe_chat(chat_id, request_text)
+            if settings.generate_chat_titles
+            else None
+        )
         rendered = title or fallback_title
         applied = await chainlit_layer.complete_chat_title(
             chat_id, rendered, fallback=title is None
@@ -286,10 +290,10 @@ async def on_chat_resume(thread):
         thread.get("metadata", {}).get("model_profile"),
         cl.user_session.get("chat_profile"),
     )
-    if await chainlit_layer.chat_title_state(chat_id) in {
-        CHAT_TITLE_PENDING,
-        CHAT_TITLE_FALLBACK,
-    }:
+    title_state = await chainlit_layer.chat_title_state(chat_id)
+    if title_state == CHAT_TITLE_PENDING or (
+        settings.generate_chat_titles and title_state == CHAT_TITLE_FALLBACK
+    ):
         request_text = await chainlit_layer.first_user_request(chat_id)
         if request_text:
             _start_chat_title(chat_id, request_text)
@@ -336,7 +340,9 @@ async def _handle_message(message: cl.Message, chat_id: str) -> None:
     should_title = False
     if is_first_turn:
         should_title = await chainlit_layer.begin_chat_title(chat_id)
-    elif title_state in {CHAT_TITLE_PENDING, CHAT_TITLE_FALLBACK}:
+    elif title_state == CHAT_TITLE_PENDING or (
+        settings.generate_chat_titles and title_state == CHAT_TITLE_FALLBACK
+    ):
         should_title = await chainlit_layer.begin_chat_title(chat_id)
     if should_title:
         current_title_source = chat_title_source(

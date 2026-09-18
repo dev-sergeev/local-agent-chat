@@ -162,6 +162,7 @@ def initialize(args: argparse.Namespace) -> None:
         or os.environ.get("APP_DATA_DIR")
         or ".local-agent-chat",
         "MODEL_PROFILES_FILE": "models.yaml",
+        "APP_GENERATE_CHAT_TITLES": "false",
         "CHAINLIT_AUTH_SECRET": secrets.token_urlsafe(48),
         key_name: key,
     }
@@ -173,7 +174,7 @@ def initialize(args: argparse.Namespace) -> None:
         f"{name}={_quote(value)}\n" for name, value in values.items()
     )
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    _path(values["APP_DATA_DIR"], directory).mkdir(
+    data_directory(directory, value=values["APP_DATA_DIR"]).mkdir(
         parents=True, exist_ok=True, mode=0o700
     )
     _write_private(
@@ -220,11 +221,9 @@ def run(args: argparse.Namespace) -> int:
         _path(os.environ.get("MODEL_PROFILES_FILE", "models.yaml"), directory)
     )
     os.environ["APP_DATA_DIR"] = str(
-        _path(
-            args.data_dir
-            or os.environ.get("APP_DATA_DIR")
-            or data_directory(directory),
+        data_directory(
             directory,
+            value=args.data_dir or os.environ.get("APP_DATA_DIR"),
         )
     )
     host = args.host or os.environ.get("APP_HOST", "127.0.0.1")

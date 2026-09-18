@@ -244,6 +244,13 @@ async def test_classic_tool_loop_has_only_sandbox_reads_and_emits_events(tmp_pat
 
     answer = await runtime.submit("chat", "turn", "Read note.txt", emit)
     assert "sandbox evidence" in answer
+    for request in model.requests:
+        assert request[0].type == "system"
+        assert (
+            "Call at most one tool per assistant message. "
+            "Do not make multiple or parallel tool calls. "
+            "Wait for the tool result before calling another tool."
+        ) in request[0].content
     assert set(model.tool_names) == {"ls", "read_file", "glob", "grep"}
     assert any(isinstance(e, ToolStarted) for e in events)
     assert any(isinstance(e, ToolFinished) for e in events)

@@ -88,6 +88,7 @@ class Settings:
     models: tuple[ModelProfile, ...]
     llm_retry: LLMRetryConfig
     agent: AgentConfig = AgentConfig()
+    generate_chat_titles: bool = False
 
 
 def _root_path(value: str) -> str:
@@ -196,16 +197,15 @@ def load_settings() -> Settings:
     if not profiles:
         raise ValueError("At least one Model Profile must be configured")
 
-    data_dir = Path(
-        os.environ.get("APP_DATA_DIR") or data_directory(directory)
-    ).expanduser()
-    if not data_dir.is_absolute():
-        data_dir = directory / data_dir
     return Settings(
         root_path=_root_path(os.environ.get("APP_ROOT_PATH", "")),
-        data_dir=data_dir.resolve(),
+        data_dir=data_directory(directory, value=os.environ.get("APP_DATA_DIR")),
         models=profiles,
         llm_retry=llm_retry,
+        generate_chat_titles=os.environ.get("APP_GENERATE_CHAT_TITLES", "")
+        .strip()
+        .lower()
+        == "true",
         agent=AgentConfig(
             **{
                 name: _bounded_int(

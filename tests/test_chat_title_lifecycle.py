@@ -78,9 +78,15 @@ async def _wait_for_title_attempt(layer, expected_state: str) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("generate_titles", [None, "false", "true", "TRUE", "1"])
 async def test_transient_chat_title_failure_retries_on_next_turn(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, generate_titles: str | None
 ) -> None:
+    if generate_titles is None:
+        monkeypatch.delenv("APP_GENERATE_CHAT_TITLES", raising=False)
+    else:
+        monkeypatch.setenv("APP_GENERATE_CHAT_TITLES", generate_titles)
+    enabled = generate_titles in {"true", "TRUE"}
     monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "app-data"))
     monkeypatch.setenv(
         "MODEL_PROFILES_FILE", str(Path("models.example.yaml").resolve())
@@ -153,7 +159,15 @@ async def test_transient_chat_title_failure_retries_on_next_turn(
         second = cl.Message(id="turn-2", content="Продолжай", type="user_message")
         await layer.create_step(second.to_dict())
         await chat_app.on_message(second)
-        await _wait_for_title_attempt(layer, CHAT_TITLE_GENERATED)
+        await _wait_for_title_attempt(
+            layer, CHAT_TITLE_GENERATED if enabled else "fallback"
+        )
+
+        resumed = await layer.get_thread("chat-1")
+        await chat_app.on_chat_resume(resumed)
+        pending = list(chat_app.chat_title_tasks.values())
+        if pending:
+            await asyncio.gather(*pending)
 
         thread = await layer.get_thread("chat-1")
         visible_title = emitter.title_events[-1]
@@ -164,10 +178,10 @@ async def test_transient_chat_title_failure_retries_on_next_turn(
             visible_title,
             title_model.calls,
         ) == (
-            EXPECTED_TITLE,
-            CHAT_TITLE_GENERATED,
-            EXPECTED_TITLE,
-            2,
+            EXPECTED_TITLE if enabled else fallback_chat_title(first_request),
+            CHAT_TITLE_GENERATED if enabled else "fallback",
+            EXPECTED_TITLE if enabled else fallback_chat_title(first_request),
+            2 if enabled else 0,
         )
     finally:
         pending = list(chat_app.chat_title_tasks.values())
