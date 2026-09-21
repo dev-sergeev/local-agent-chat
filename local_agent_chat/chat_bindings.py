@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterable, Iterator
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+
+from .sqlite_storage import SQLiteDatabase
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +22,7 @@ class ChatBindings:
         if not self._profiles or any(not p for p in self._profiles):
             raise ValueError("At least one nonempty Model Profile must be available")
         self._database = database
+        self._sqlite = SQLiteDatabase(database)
         self._deleting: set[str] = set()
         database.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
@@ -40,7 +43,7 @@ class ChatBindings:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        with closing(sqlite3.connect(self._database, timeout=30)) as db, db:
+        with self._sqlite.connect(timeout=30) as db:
             yield db
 
     def get(self, chat_id: str) -> ChatBinding | None:

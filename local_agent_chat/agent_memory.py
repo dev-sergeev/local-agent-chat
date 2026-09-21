@@ -10,16 +10,19 @@ import json
 import sqlite3
 import uuid
 from collections.abc import Iterator
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
 
 from langchain_core.messages import BaseMessage, messages_from_dict, messages_to_dict
+
+from .sqlite_storage import SQLiteDatabase
 
 
 class AgentMemory:
     def __init__(self, database: Path) -> None:
         database.parent.mkdir(parents=True, exist_ok=True)
         self.database = database
+        self._sqlite = SQLiteDatabase(database)
         with self._connect() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS agent_context (
@@ -34,7 +37,7 @@ class AgentMemory:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        with closing(sqlite3.connect(self.database, timeout=30)) as db, db:
+        with self._sqlite.connect(timeout=30) as db:
             yield db
 
     @staticmethod

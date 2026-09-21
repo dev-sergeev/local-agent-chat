@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Iterator
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 from .runtime import HistorySnapshot, Turn
+from .sqlite_storage import SQLiteDatabase
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,7 @@ class SQLiteHistory:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._path = path
+        self._sqlite = SQLiteDatabase(path)
         with self._connect() as connection:
             connection.executescript(
                 """
@@ -50,7 +52,7 @@ class SQLiteHistory:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        with closing(sqlite3.connect(self._path)) as connection, connection:
+        with self._sqlite.connect() as connection:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA secure_delete = ON")
             yield connection

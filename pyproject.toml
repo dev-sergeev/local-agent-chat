@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "local-agent-chat"
-version = "0.2.1"
+version = "0.2.2"
 description = "Local chat UI for OpenAI-compatible and GigaChat models with persistent history"
 readme = "README.md"
 license = "MIT"

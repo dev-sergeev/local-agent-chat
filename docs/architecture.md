@@ -13,6 +13,7 @@ LocalChat consists of Chainlit and one LangChain `create_agent` ReAct loop. See 
 | `chat_bindings.py` | Immutable available Model Profile; fallback if a profile was removed |
 | `runtime.py` | Serialize each Turn and coordinate compensating rollback across context/files/history |
 | `sqlite_history.py` | Current completed Turns and legacy visible-context import |
+| `sqlite_storage.py` | SQLite connection policy and per-file transaction ownership in opt-in NFS mode |
 | `chainlit_data.py`, `chainlit_revision.py`, `chainlit_persistence.py` | Ordered UI history, native editing, temporary recovery and awaited background writes |
 | `llm_retry.py`, `auxiliary_labels.py` | Provider retry policy and bounded asynchronous titles |
 
@@ -37,6 +38,12 @@ Virtual `/` maps only to the current Chat's `files/` directory. `ls`, `read_file
 The application retains ownership of uploads and snapshots. Earlier `artifacts/` directories are still copied/restored as legacy Sandbox data; the new agent creates no context offload files and cannot read that tree.
 
 ## Persistence and Revision
+
+`LOCALCHAT_SQLITE_NOLOCK=1` explicitly enables SQLite URI `nolock` for NFS without functional SQLite locks. Store construction reads the setting after CLI dotenv loading and freezes it until restart. `SQLiteDatabase` shares a process-local gate by resolved file path across schema setup, synchronous stores and complete Chainlit sessions. This includes the two adapters using `checkpoints.sqlite3`. Chainlit uses a one-connection pool without overflow; the shared session gate also covers multiple layer instances and all inherited SQL methods. Async acquisition never blocks the event loop. Cancellation drains active SQL and transaction cleanup before releasing the gate, including repeated cancellation. Normal mode retains SQLite locking and its default journal/sync policy.
+
+NFS connections enforce DELETE journals and EXTRA synchronization. Persistent WAL headers are rejected before opening SQLite rather than migrated on a filesystem with broken locks. The CLI's existing `flock` plus atomic-directory guard remains the cross-process boundary. It is never automatically reclaimed; a missing parent PID does not prove its child or another pod stopped. Direct server launches and external database readers/writers must not bypass that boundary. This mode relies on correct NFS synchronization and does not add crash-atomic commits spanning multiple database files or Sandbox/blob state.
+
+The infrastructure constraint and durability trade-off are recorded in [ADR 0015](adr/0015-serialize-sqlite-access-on-lockless-nfs.md).
 
 `agent_context` stores current serialized messages by Chat. `agent_snapshots` stores messages before a Turn; a version-4 checkpoint token identifies an owned snapshot. The ReAct graph itself is ephemeral between calls. This avoids dependencies on LangGraph DeltaChannel ancestry, branch IDs and node schemas.
 

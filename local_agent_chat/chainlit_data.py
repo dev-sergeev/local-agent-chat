@@ -5,7 +5,7 @@ import json
 import logging
 import sqlite3
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, closing
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
@@ -24,6 +24,7 @@ from .chat_titles import (
     DEFAULT_CHAT_TITLE,
     chat_title_source,
 )
+from .sqlite_storage import SQLiteDatabase
 from .tool_logs import format_tool_log
 
 logger = logging.getLogger(__name__)
@@ -80,8 +81,13 @@ REVISION_ARCHIVE_VERSION = 2
 class SQLiteChainlitDataLayer(SQLAlchemyDataLayer):
     chat_cleanup = None
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, database: SQLiteDatabase | None = None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        if database is not None and database.nolock:
+            # Upstream does not expose engine/pool options. Its constructor's
+            # lazy engine has not opened any connections yet.
+            self.engine.sync_engine.dispose()
+            self.engine, self.async_session = database.serialized_sessions()
         self._step_locks: dict[str, asyncio.Lock] = {}
         self._thread_locks: dict[str, asyncio.Lock] = {}
         self._initial_name_events: dict[str, asyncio.Event] = {}
@@ -756,9 +762,10 @@ def create_chainlit_data_layer(
     path: Path, storage: BaseStorageClient | None = None
 ) -> SQLiteChainlitDataLayer:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(path)) as connection, connection:
+    database = SQLiteDatabase(path)
+    with database.connect() as connection:
         connection.executescript(SCHEMA)
         _migrate_schema(connection)
     return SQLiteChainlitDataLayer(
-        conninfo=f"sqlite+aiosqlite:///{path}", storage_provider=storage
+        conninfo=database.url, storage_provider=storage, database=database
     )
